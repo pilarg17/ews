@@ -1,0 +1,98 @@
+[
+  {
+    "file": "Available_Indicators_Current.py",
+    "lines": 3852,
+    "bytes": 105552,
+    "sha256": "6c26830d44003a98dcc5d5b80101a79b39c65199c7772cfb21b387926996b9ee"
+  },
+  {
+    "file": "Available_Indicators_Previous.py",
+    "lines": 3849,
+    "bytes": 105801,
+    "sha256": "fb0d8e44ebc4b3d6e5e8eb3cd95bc9f80e9aad8eeebfc8d07979eb46c7aea5fd"
+  },
+  {
+    "file": "CC_Utilisation_History_Current.py",
+    "lines": 1092,
+    "bytes": 24114,
+    "sha256": "58542a54232b980dce0af6000abc47e71d946ab1c20ea5d4250cf52b95941e3c"
+  },
+  {
+    "file": "CC_Utilisation_History_Previous.py",
+    "lines": 1092,
+    "bytes": 24186,
+    "sha256": "f821f32c352eb022280a293e3d8a7ca48387731ac08a208ecc1639889c40eda2"
+  },
+  {
+    "file": "Credit_Cards_Current.py",
+    "lines": 1012,
+    "bytes": 20256,
+    "sha256": "f6e162151bd0d951f2520f9933acde7dfeec6dec6ac9ca91a0221fcb34d051ff"
+  },
+  {
+    "file": "Credit_Cards_Previous.py",
+    "lines": 1012,
+    "bytes": 20274,
+    "sha256": "7c055548ec9b948447aec51006b0fe15e587a0fe801386fe64e470887a8b4a82"
+  },
+  {
+    "file": "Daily_Behavioural_Features_Current.py",
+    "lines": 1064,
+    "bytes": 25405,
+    "sha256": "9c4debc67808dd46b5503df269ae544109d9f6fed966f0aaea9ba7e0881c2c79"
+  },
+  {
+    "file": "Daily_Behavioural_Features_Previous.py",
+    "lines": 1064,
+    "bytes": 25585,
+    "sha256": "8c657eff5d100eb59dfa3a2ede613e6d46cf5bb2ae400a9ee4679606bac6313a"
+  },
+  {
+    "file": "EWS_Daily_Alerts.py",
+    "lines": 1029,
+    "bytes": 30288,
+    "sha256": "70c0589fc8101f397783d96e950894cb071f68a41269965c8ca5b56e92b5f477"
+  },
+  {
+    "file": "EWS_Output_Datasets_NO_CAMBIAR.py",
+    "lines": 2652,
+    "bytes": 77974,
+    "sha256": "f640d7e8673ae9062a4ed86609e28fcd11d170137136f2bc6f0ed2d8356a92f5"
+  },
+  {
+    "file": "Entity_Information_Current.py",
+    "lines": 1408,
+    "bytes": 26375,
+    "sha256": "1c5794530483e8f10b769861f28a9ee449a4bf38b83187e7a54b310cb2780915"
+  },
+  {
+    "file": "Entity_Information_Previous.py",
+    "lines": 1408,
+    "bytes": 26411,
+    "sha256": "8a4cdd11ddd84256527ac88660e4920dea8d1a459d8e57815adc801c273d7e45"
+  },
+  {
+    "file": "RM_Data_Daily_Run_Current.py",
+    "lines": 635,
+    "bytes": 12874,
+    "sha256": "205c4a929a2a91bd56689281edc079f7addeca050616d5b7b6f1a5b5abc56c6c"
+  },
+  {
+    "file": "RM_Data_Daily_Run_Previous.py",
+    "lines": 635,
+    "bytes": 12919,
+    "sha256": "831788bd16a74f8c1fefbc67a55ba3992276ea4f12301b32148f99bb03968613"
+  },
+  {
+    "file": "Rating_GCC_History_Current.py",
+    "lines": 1209,
+    "bytes": 23302,
+    "sha256": "8335bc2488a05151ae24a701387db462fd9bec110620786bd2b035434290d680"
+  },
+  {
+    "file": "Rating_GCC_History_Previous.py",
+    "lines": 1209,
+    "bytes": 23348,
+    "sha256": "1fc4025f72e6cc68adcb475d9d957a35140ef15ec78503b146999f43841a67a2"
+  }
+]

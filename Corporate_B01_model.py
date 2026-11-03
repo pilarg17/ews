@@ -1,0 +1,810 @@
+# -*- coding: utf-8 -*-
+"""Corporate EWS | Batch B01 | DPD and Rating/GCC threshold calibration.
+
+Input:  EWS_training_B01_DPD_RATING
+Output: results_B01_DPD_RATING, test_results_B01_DPD_RATING
+
+All historical calculations execute inside Snowflake. This recipe never reads the
+full training dataset into Pandas and never changes its original source tables.
+
+For rating, the deterioration target retains the five components used in the
+historical calibration. For DPD, the target excludes the DPD component to avoid
+circular validation of thresholds 20 to 60. Both target definitions are labeled
+in the results. Business event codes and candidate GEC exposure require review.
+"""
+
+import re
+import dataiku
+from dataiku import recipe
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = "VALIDATIONEWSCORPORATEPORTFOLIODAILY"
+CONNECTION = "DEV_AA_TEAMS"
+TRAINING = "EWS_training_B01_DPD_RATING"
+RESULTS = "results_B01_DPD_RATING"
+TEST_RESULTS = "test_results_B01_DPD_RATING"
+
+# Event and cost parameters.
+MIN_LEAD_MONTHS = 1
+MAX_LEAD_MONTHS = 11
+MAX_GAP_MONTHS = 3
+MAX_SIGNAL_GAP_MONTHS = 2
+MIN_EXPOSURE = 0.0       # Event cost requires complete, positive entity exposure
+COST_TP_FIXED = 1000.0
+COST_FP = 200.0
+COST_FN_PCT = 0.20
+COST_TP_PCT_LATE = 0.20
+COST_TP_PCT_EARLY = 0.10
+
+# Predictor grids. Rating scales follow the historical calibration; 1/3/6-month differences use previous calendar-month snapshots.
+INDICATORS = [
+    "DPD_MAX", "CLIENT_NOTCH", "GCC_NOTCH", "PD_CRR", "GCC_PD_CRR",
+    "CLIENT_DOWNGRADE_1M", "CLIENT_DOWNGRADE_3M", "CLIENT_DOWNGRADE_6M",
+    "CLIENT_DOWNGRADE_12M",
+    "GCC_DOWNGRADE_1M", "GCC_DOWNGRADE_3M", "GCC_DOWNGRADE_6M",
+    "GCC_DOWNGRADE_12M",
+]
+PAIRS = [
+    ("CLIENT_NOTCH", "CLIENT_DOWNGRADE_1M"),
+    ("CLIENT_NOTCH", "CLIENT_DOWNGRADE_12M"),
+    ("GCC_NOTCH", "GCC_DOWNGRADE_1M"),
+    ("GCC_NOTCH", "GCC_DOWNGRADE_12M"),
+]
+ACTIVE_INDICATORS = {
+    "CLIENT_DOWNGRADE_1M", "CLIENT_DOWNGRADE_3M", "CLIENT_DOWNGRADE_6M",
+    "CLIENT_DOWNGRADE_12M", "GCC_DOWNGRADE_1M", "GCC_DOWNGRADE_3M",
+    "GCC_DOWNGRADE_6M", "GCC_DOWNGRADE_12M",
+}
+
+THRESHOLDS = {
+    "DPD_MAX": list(range(5, 61, 5)),
+    "CLIENT_NOTCH": list(range(1, 20)),
+    "GCC_NOTCH": list(range(1, 20)),
+    "PD_CRR": [round(i * .01, 8) for i in range(1, 51)],
+    "GCC_PD_CRR": [round(i * .01, 8) for i in range(1, 51)],
+    "CLIENT_DOWNGRADE_1M": list(range(0, 19)),
+    "CLIENT_DOWNGRADE_3M": list(range(0, 19)),
+    "CLIENT_DOWNGRADE_6M": list(range(0, 19)),
+    "CLIENT_DOWNGRADE_12M": list(range(0, 19)),
+    "GCC_DOWNGRADE_1M": list(range(0, 19)),
+    "GCC_DOWNGRADE_3M": list(range(0, 19)),
+    "GCC_DOWNGRADE_6M": list(range(0, 19)),
+    "GCC_DOWNGRADE_12M": list(range(0, 19)),
+}
+RATING_NAMES = [
+    "AAA+", "AAA", "AA+", "AA", "AA-", "A+", "A", "A-", "BBB+",
+    "BBB", "BBB-", "BB+", "BB", "BB-", "B+", "B", "B-", "CCC", "D",
+]
+
+
+def q(value):
+    value = str(value).replace("${projectKey}", PROJECT)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError("Invalid Snowflake identifier: " + repr(value))
+    return '"' + value + '"'
+
+
+project = dataiku.api_client().get_project(PROJECT)
+
+
+def get_table(dataset_name, required):
+    cfg = project.get_dataset(dataset_name).get_settings().get_raw()
+    p = cfg.get("params") or {}
+    if p.get("connection") != CONNECTION:
+        raise ValueError("Unexpected connection for " + dataset_name)
+    found = {c["name"].upper() for c in dataiku.Dataset(
+        dataset_name, project_key=PROJECT).read_schema()}
+    missing = set(required) - found
+    if missing:
+        raise ValueError("Missing fields in {}: {}".format(
+            dataset_name, sorted(missing)))
+    return q(p["schema"]) + "." + q(p["table"])
+
+
+required_source = [
+    "ENTITY_ID", "MAP_DTE", "DPD_MAX", "PD_CRR", "GCC_PD_CRR",
+    "CLIENT_NOTCH", "GCC_NOTCH", "CLIENT_DOWNGRADE_12M",
+    "GCC_DOWNGRADE_12M", "LOAN_COUNT", "HAS_VALID_ENTITY_HISTORY",
+    "NOMINAL_KNOWN_SUM", "NOMINAL_KNOWN_LOANS", "LOAN_SOURCE_DUPLICATES",
+    "GEC_NOMINAL_CANDIDATE", "GEC_GCA_CANDIDATE",
+    "TGT_ANY_SAMEDAY", "TGT_DEFAULT_SAMEDAY",
+    "TGT_FORBEARANCE_SAMEDAY", "TGT_DIM1_SAMEDAY",
+]
+SOURCE = get_table(TRAINING, required_source)
+
+# Enforce exact, isolated batch outputs. No original recipes/tables are overwritten.
+expected_outputs = {RESULTS, TEST_RESULTS}
+configured_outputs = {
+    str(getattr(item, "name", item)).split(".")[-1]
+    for item in recipe.get_outputs(object_type="DATASET")
+}
+if configured_outputs != expected_outputs:
+    raise ValueError("Configure exactly these outputs: " + ", ".join(sorted(expected_outputs)))
+
+for dataset_name in sorted(expected_outputs):
+    settings = project.get_dataset(dataset_name).get_settings().get_raw()
+    p = settings.get("params") or {}
+    physical_name = str(p.get("table", "")).replace("${projectKey}", PROJECT)
+    expected_physical = PROJECT + "_" + dataset_name.upper()
+    if (p.get("connection") != CONNECTION
+            or str(p.get("schema", "")).upper() != "RRG"
+            or physical_name.upper() != expected_physical):
+        raise ValueError(
+            "Invalid output table for {}. Use connection {}, schema RRG, "
+            "table {}".format(dataset_name, CONNECTION, expected_physical)
+        )
+
+# New output datasets have no Dataiku schema before their first build.
+# Their physical Snowflake table names were checked above, so resolve the
+# results table directly rather than calling read_schema() on an empty output.
+TARGET_TABLE = q("RRG") + "." + q(PROJECT + "_" + RESULTS.upper())
+
+# Threshold arrays are small and generated once in Python.
+grid_values = ",\n        ".join(
+    "('{}', {:.8f})".format(ind, float(t))
+    for ind in INDICATORS for t in THRESHOLDS[ind]
+)
+
+single_fields = ", ".join(INDICATORS)
+previous_fields = ",\n           ".join(
+    "LAG({name}) OVER(PARTITION BY ENTITY_ID ORDER BY MAP_DTE) AS PREV_{name}".format(name=i)
+    for i in INDICATORS
+)
+previous_choice = "CASE u.PREDICTOR " + " ".join(
+    "WHEN '{}' THEN u.PREV_{}".format(i, i) for i in INDICATORS
+) + " ELSE NULL END"
+
+pair_grids = "\nUNION ALL\n".join(
+    "SELECT '{a} x {b}' AS INDICATOR, '{a}' AS PREDICTOR_A, "
+    "'{b}' AS PREDICTOR_B, a.THRESHOLD AS THRESHOLD_A, "
+    "b.THRESHOLD AS THRESHOLD_B "
+    "FROM GRID_SINGLE a JOIN GRID_SINGLE b "
+    "ON a.PREDICTOR='{a}' AND b.PREDICTOR='{b}'".format(a=a, b=b)
+    for a, b in PAIRS
+)
+
+pair_starts = []
+for a, b in PAIRS:
+    pair_name = a + " x " + b
+    # Either predictor may provide a new start, while the other is active.
+    pair_starts.append("""
+SELECT '{pair}' AS INDICATOR, '{a}' AS PREDICTOR_A, '{b}' AS PREDICTOR_B,
+       s.ENTITY_ID, s.MAP_DTE, s.THRESHOLD_A, g.THRESHOLD AS THRESHOLD_B
+FROM SINGLE_START s
+JOIN PREP p ON p.ENTITY_ID=s.ENTITY_ID AND p.MAP_DTE=s.MAP_DTE AND p.TARGET_SCOPE='RATING'
+JOIN GRID_SINGLE g ON g.PREDICTOR='{b}' AND p.{b}>g.THRESHOLD
+WHERE s.INDICATOR='{a}' AND p.TARGET=0 AND p.TARGET_SCOPE='RATING'
+UNION ALL
+SELECT '{pair}' AS INDICATOR, '{a}' AS PREDICTOR_A, '{b}' AS PREDICTOR_B,
+       s.ENTITY_ID, s.MAP_DTE, g.THRESHOLD AS THRESHOLD_A, s.THRESHOLD_A AS THRESHOLD_B
+FROM SINGLE_START s
+JOIN PREP p ON p.ENTITY_ID=s.ENTITY_ID AND p.MAP_DTE=s.MAP_DTE AND p.TARGET_SCOPE='RATING'
+JOIN GRID_SINGLE g ON g.PREDICTOR='{a}' AND p.{a}>g.THRESHOLD
+WHERE s.INDICATOR='{b}' AND p.TARGET=0 AND p.TARGET_SCOPE='RATING'
+""".format(pair=pair_name, a=a, b=b))
+pair_starts_sql = "\nUNION ALL\n".join(pair_starts)
+
+active_grid_names = "(" + ",".join("'{}'".format(v) for v in ACTIVE_INDICATORS) + ")"
+rating_a_sql = "CASE WHEN m.PREDICTOR_A IN ('CLIENT_NOTCH','GCC_NOTCH') THEN " \
+    + "CASE m.THRESHOLD_A " + " ".join(
+        "WHEN {} THEN '{}'".format(i, name) for i, name in enumerate(RATING_NAMES, 1)
+    ) + " ELSE NULL END ELSE NULL END"
+rating_b_sql = "CASE WHEN m.PREDICTOR_B IN ('CLIENT_NOTCH','GCC_NOTCH') THEN " \
+    + "CASE m.THRESHOLD_B " + " ".join(
+        "WHEN {} THEN '{}'".format(i, name) for i, name in enumerate(RATING_NAMES, 1)
+    ) + " ELSE NULL END ELSE NULL END"
+
+
+# GEC exposure grid, used solely as a materiality filter for DPD signals.
+GEC_THRESHOLDS = list(range(50_000, 1_000_001, 50_000))
+GEC_INDICATOR = "DPD_MAX x GEC_EXPOSURE"
+GEC_GRID_VALUES = ", ".join("({})".format(t) for t in GEC_THRESHOLDS)
+
+# Rating pair eligibility is based on both predictors being available in the
+# historical lead window; it is not restricted by a GEC materiality threshold.
+rating_pair_eligible = "\nUNION ALL\n".join(
+    "SELECT DISTINCT '{a} x {b}' AS INDICATOR, "
+    "CAST(NULL AS DOUBLE) AS EXPOSURE_CUTOFF, e.EVENT_ID,e.EVENT_EXPOSURE "
+    "FROM EVENTS e JOIN PREP p ON e.ENTITY_ID=p.ENTITY_ID "
+    "AND p.TARGET_SCOPE='RATING' AND e.TARGET_SCOPE='RATING' "
+    "AND p.MAP_DTE BETWEEN DATEADD(month,-{hi},e.EVENT_START) "
+    "AND DATEADD(month,-{lo},e.EVENT_START) "
+    "WHERE p.TARGET=0 AND p.{a} IS NOT NULL AND p.{b} IS NOT NULL".format(
+        a=a,b=b,hi=MAX_LEAD_MONTHS,lo=MIN_LEAD_MONTHS)
+    for a,b in PAIRS
+)
+
+SQL = r"""
+WITH
+LAST_VALID_DPD AS (
+    SELECT MAX(TO_DATE(MAP_DTE)) AS LAST_DPD_DATE
+    FROM {SOURCE}
+    WHERE DPD_MAX IS NOT NULL AND LOAN_COUNT>0
+),
+PANEL_RAW AS (
+    SELECT
+        t.ENTITY_ID::VARCHAR AS ENTITY_ID,
+        TO_DATE(t.MAP_DTE) AS MAP_DTE,
+        TRY_TO_DOUBLE(t.DPD_MAX::VARCHAR) AS DPD_MAX,
+        TRY_TO_DOUBLE(t.CLIENT_NOTCH::VARCHAR) AS CLIENT_NOTCH,
+        TRY_TO_DOUBLE(t.GCC_NOTCH::VARCHAR) AS GCC_NOTCH,
+        TRY_TO_DOUBLE(t.PD_CRR::VARCHAR) AS PD_CRR,
+        TRY_TO_DOUBLE(t.GCC_PD_CRR::VARCHAR) AS GCC_PD_CRR,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_12M::VARCHAR) AS CLIENT_DOWNGRADE_12M,
+        TRY_TO_DOUBLE(t.GCC_DOWNGRADE_12M::VARCHAR) AS GCC_DOWNGRADE_12M,
+        TRY_TO_DOUBLE(t.GEC_NOMINAL_CANDIDATE::VARCHAR) AS GEC_EXPOSURE,
+        CASE WHEN t.LOAN_COUNT>0 AND t.LOAN_SOURCE_DUPLICATES=0
+                  AND t.NOMINAL_KNOWN_LOANS=t.LOAN_COUNT
+             THEN TRY_TO_DOUBLE(t.NOMINAL_KNOWN_SUM::VARCHAR)
+             ELSE NULL END AS EXPOSURE,
+        TRY_TO_NUMBER(t.TGT_ANY_SAMEDAY::VARCHAR) AS TARGET_RETAIL,
+        CASE
+          WHEN TRY_TO_DOUBLE(t.PD_CRR::VARCHAR)=1
+             OR t.TGT_DEFAULT_SAMEDAY=1
+             OR t.TGT_FORBEARANCE_SAMEDAY=1
+             OR t.TGT_DIM1_SAMEDAY=1 THEN 1
+          WHEN t.PD_CRR IS NULL
+             OR t.TGT_DEFAULT_SAMEDAY IS NULL
+             OR t.TGT_FORBEARANCE_SAMEDAY IS NULL
+             OR t.TGT_DIM1_SAMEDAY IS NULL THEN NULL
+          ELSE 0
+        END AS TARGET_EXCL_DPD
+    FROM {SOURCE} t
+    WHERE t.LOAN_COUNT>0 AND t.HAS_VALID_ENTITY_HISTORY=1
+      AND TO_DATE(t.MAP_DTE)<=(SELECT LAST_DPD_DATE FROM LAST_VALID_DPD)
+),
+RATING_MONTH AS (
+    SELECT ENTITY_ID,
+           TO_DATE(DATE_TRUNC('MONTH',MAP_DTE)) AS MONTH_START,
+           MAX_BY(CLIENT_NOTCH,MAP_DTE) AS CLIENT_NOTCH_END_MONTH,
+           MAX_BY(GCC_NOTCH,MAP_DTE) AS GCC_NOTCH_END_MONTH
+    FROM PANEL_RAW
+    GROUP BY 1,2
+),
+CORPORATE_PANEL AS (
+    SELECT p.*,
+           p.CLIENT_NOTCH-r1.CLIENT_NOTCH_END_MONTH AS CLIENT_DOWNGRADE_1M,
+           p.CLIENT_NOTCH-r3.CLIENT_NOTCH_END_MONTH AS CLIENT_DOWNGRADE_3M,
+           p.CLIENT_NOTCH-r6.CLIENT_NOTCH_END_MONTH AS CLIENT_DOWNGRADE_6M,
+           p.GCC_NOTCH-r1.GCC_NOTCH_END_MONTH AS GCC_DOWNGRADE_1M,
+           p.GCC_NOTCH-r3.GCC_NOTCH_END_MONTH AS GCC_DOWNGRADE_3M,
+           p.GCC_NOTCH-r6.GCC_NOTCH_END_MONTH AS GCC_DOWNGRADE_6M
+    FROM PANEL_RAW p
+    LEFT JOIN RATING_MONTH r1 ON r1.ENTITY_ID=p.ENTITY_ID
+       AND r1.MONTH_START=DATEADD(month,-1,TO_DATE(DATE_TRUNC('MONTH',p.MAP_DTE)))
+    LEFT JOIN RATING_MONTH r3 ON r3.ENTITY_ID=p.ENTITY_ID
+       AND r3.MONTH_START=DATEADD(month,-3,TO_DATE(DATE_TRUNC('MONTH',p.MAP_DTE)))
+    LEFT JOIN RATING_MONTH r6 ON r6.ENTITY_ID=p.ENTITY_ID
+       AND r6.MONTH_START=DATEADD(month,-6,TO_DATE(DATE_TRUNC('MONTH',p.MAP_DTE)))
+),
+TARGET_PANELS AS (
+    SELECT p.*, 'RATING' AS TARGET_SCOPE, TARGET_RETAIL AS TARGET
+    FROM CORPORATE_PANEL p
+    UNION ALL
+    SELECT p.*, 'DPD' AS TARGET_SCOPE, TARGET_EXCL_DPD AS TARGET
+    FROM CORPORATE_PANEL p WHERE p.DPD_MAX IS NOT NULL
+),
+PANEL_END AS (
+    SELECT MAX(MAP_DTE) AS END_DATE FROM CORPORATE_PANEL
+),
+FIRST_OBS AS (
+    SELECT TARGET_SCOPE,ENTITY_ID,MIN(MAP_DTE) AS FIRST_DATE
+    FROM TARGET_PANELS GROUP BY 1,2
+),
+EVENT_ACTIVE AS (
+    SELECT TARGET_SCOPE,ENTITY_ID,MAP_DTE,
+           LAG(MAP_DTE) OVER(
+               PARTITION BY TARGET_SCOPE,ENTITY_ID ORDER BY MAP_DTE
+           ) AS PREV_ACTIVE
+    FROM TARGET_PANELS WHERE TARGET=1
+),
+EVENT_GROUPS AS (
+    SELECT TARGET_SCOPE,ENTITY_ID,MAP_DTE,
+           SUM(CASE WHEN PREV_ACTIVE IS NULL
+                       OR MAP_DTE>DATEADD(month,{event_gap},PREV_ACTIVE)
+                    THEN 1 ELSE 0 END)
+           OVER(PARTITION BY TARGET_SCOPE,ENTITY_ID ORDER BY MAP_DTE
+                ROWS UNBOUNDED PRECEDING) AS EVENT_GROUP
+    FROM EVENT_ACTIVE
+),
+EVENT_DATES AS (
+    SELECT TARGET_SCOPE,ENTITY_ID,EVENT_GROUP,
+           MIN(MAP_DTE) AS EVENT_START,MAX(MAP_DTE) AS EVENT_END
+    FROM EVENT_GROUPS GROUP BY 1,2,3
+),
+EVENTS AS (
+    SELECT CONCAT(e.TARGET_SCOPE,'|',e.ENTITY_ID,'|',TO_VARCHAR(e.EVENT_START)) AS EVENT_ID,
+           e.TARGET_SCOPE,e.ENTITY_ID,e.EVENT_START,e.EVENT_END,
+           p.EXPOSURE AS EVENT_EXPOSURE
+    FROM EVENT_DATES e
+    JOIN FIRST_OBS f ON f.ENTITY_ID=e.ENTITY_ID AND f.TARGET_SCOPE=e.TARGET_SCOPE
+    JOIN TARGET_PANELS p ON p.ENTITY_ID=e.ENTITY_ID
+      AND p.MAP_DTE=e.EVENT_START AND p.TARGET_SCOPE=e.TARGET_SCOPE
+    WHERE e.EVENT_START>=DATEADD(month,{lead_hi},f.FIRST_DATE)
+      AND p.EXPOSURE>{min_exposure}
+),
+PREP AS (
+    SELECT TARGET_SCOPE,ENTITY_ID,MAP_DTE,TARGET,EXPOSURE,GEC_EXPOSURE,
+           {single_fields},
+           LAG(MAP_DTE) OVER(
+               PARTITION BY TARGET_SCOPE,ENTITY_ID ORDER BY MAP_DTE
+           ) AS PREV_DTE,
+           LAG(TARGET) OVER(
+               PARTITION BY TARGET_SCOPE,ENTITY_ID ORDER BY MAP_DTE
+           ) AS PREV_TARGET,
+           {previous_fields}
+    FROM TARGET_PANELS
+    WHERE EXPOSURE>{min_exposure}
+),
+GRID_SINGLE AS (
+    SELECT COLUMN1::VARCHAR AS PREDICTOR,COLUMN2::DOUBLE AS THRESHOLD
+    FROM VALUES {grid_values}
+),
+GRID_GEC AS (
+    SELECT COLUMN1::DOUBLE AS THRESHOLD
+    FROM VALUES {gec_grid_values}
+),
+GRID_ALL AS (
+    SELECT PREDICTOR AS INDICATOR,PREDICTOR AS PREDICTOR_A,
+           CAST(NULL AS VARCHAR) AS PREDICTOR_B,
+           THRESHOLD AS THRESHOLD_A,CAST(NULL AS DOUBLE) AS THRESHOLD_B
+    FROM GRID_SINGLE WHERE PREDICTOR <> 'DPD_MAX'
+    UNION ALL
+    {pair_grids}
+    UNION ALL
+    SELECT '{gec_indicator}' AS INDICATOR,
+           'DPD_MAX' AS PREDICTOR_A,'GEC_EXPOSURE' AS PREDICTOR_B,
+           d.THRESHOLD AS THRESHOLD_A,g.THRESHOLD AS THRESHOLD_B
+    FROM GRID_SINGLE d CROSS JOIN GRID_GEC g WHERE d.PREDICTOR='DPD_MAX'
+),
+FLAT_FEATURES AS (
+    SELECT u.TARGET_SCOPE,u.ENTITY_ID,u.MAP_DTE,u.TARGET,u.PREV_TARGET,u.PREV_DTE,
+           u.EXPOSURE,u.PREDICTOR,u.FEATURE_VALUE,
+           {previous_choice} AS PREVIOUS_VALUE
+    FROM PREP f
+    UNPIVOT EXCLUDE NULLS (FEATURE_VALUE FOR PREDICTOR IN ({single_fields})) u
+    WHERE (u.TARGET_SCOPE='DPD' AND u.PREDICTOR='DPD_MAX')
+       OR (u.TARGET_SCOPE='RATING' AND u.PREDICTOR<>'DPD_MAX')
+),
+SINGLE_START AS (
+    SELECT f.PREDICTOR AS INDICATOR,f.PREDICTOR AS PREDICTOR_A,
+           CAST(NULL AS VARCHAR) AS PREDICTOR_B,
+           f.TARGET_SCOPE,f.ENTITY_ID,f.MAP_DTE,g.THRESHOLD AS THRESHOLD_A,
+           CAST(NULL AS DOUBLE) AS THRESHOLD_B
+    FROM FLAT_FEATURES f
+    JOIN GRID_SINGLE g ON g.PREDICTOR=f.PREDICTOR
+      AND ((f.PREDICTOR='DPD_MAX' AND f.FEATURE_VALUE>=g.THRESHOLD)
+        OR (f.PREDICTOR<>'DPD_MAX' AND f.FEATURE_VALUE>g.THRESHOLD))
+    WHERE f.TARGET=0 AND (
+       (f.PREDICTOR NOT IN {active_grid_names}
+        AND f.PREV_TARGET=0
+        AND DATEDIFF(day,f.PREV_DTE,f.MAP_DTE)=1
+        AND f.PREVIOUS_VALUE IS NOT NULL
+        AND ((f.PREDICTOR='DPD_MAX' AND f.PREVIOUS_VALUE<g.THRESHOLD)
+          OR (f.PREDICTOR<>'DPD_MAX' AND f.PREVIOUS_VALUE<=g.THRESHOLD)))
+       OR
+       (f.PREDICTOR IN {active_grid_names}
+        AND (f.PREV_TARGET IS NULL OR f.PREV_TARGET<>0
+             OR f.PREV_DTE IS NULL
+             OR DATEDIFF(day,f.PREV_DTE,f.MAP_DTE)<>1
+             OR f.PREVIOUS_VALUE IS NULL
+             OR f.PREVIOUS_VALUE<=g.THRESHOLD))
+    )
+),
+RATING_PAIR_START AS (
+    {pair_starts_sql}
+),
+DPD_GEC_START AS (
+    SELECT '{gec_indicator}' AS INDICATOR,
+           'DPD_MAX' AS PREDICTOR_A, 'GEC_EXPOSURE' AS PREDICTOR_B,
+           s.ENTITY_ID,s.MAP_DTE,s.THRESHOLD_A,g.THRESHOLD AS THRESHOLD_B
+    FROM SINGLE_START s
+    JOIN PREP p ON p.TARGET_SCOPE='DPD'
+      AND p.ENTITY_ID=s.ENTITY_ID AND p.MAP_DTE=s.MAP_DTE
+    JOIN GRID_GEC g ON p.GEC_EXPOSURE>=g.THRESHOLD
+    WHERE s.INDICATOR='DPD_MAX' AND s.TARGET_SCOPE='DPD'
+),
+SIGNAL_STARTS AS (
+    SELECT DISTINCT INDICATOR,PREDICTOR_A,PREDICTOR_B,
+           ENTITY_ID,MAP_DTE,THRESHOLD_A,THRESHOLD_B
+    FROM (
+        SELECT INDICATOR,PREDICTOR_A,PREDICTOR_B,ENTITY_ID,MAP_DTE,
+               THRESHOLD_A,THRESHOLD_B FROM SINGLE_START
+               WHERE INDICATOR<>'DPD_MAX'
+        UNION ALL
+        SELECT INDICATOR,PREDICTOR_A,PREDICTOR_B,ENTITY_ID,MAP_DTE,
+               THRESHOLD_A,THRESHOLD_B FROM RATING_PAIR_START
+        UNION ALL
+        SELECT * FROM DPD_GEC_START
+    )
+    WHERE MAP_DTE<=DATEADD(month,-{lead_lo},(SELECT END_DATE FROM PANEL_END))
+),
+SIGNAL_PREVIOUS AS (
+    SELECT s.*,
+           LAG(MAP_DTE) OVER(
+               PARTITION BY INDICATOR,THRESHOLD_A,THRESHOLD_B,ENTITY_ID
+               ORDER BY MAP_DTE) AS PREV_START
+    FROM SIGNAL_STARTS s
+),
+SIGNAL_GROUPS AS (
+    SELECT s.*,
+           SUM(CASE WHEN PREV_START IS NULL
+                         OR MAP_DTE>DATEADD(month,{signal_gap},PREV_START)
+                    THEN 1 ELSE 0 END)
+           OVER(PARTITION BY INDICATOR,THRESHOLD_A,THRESHOLD_B,ENTITY_ID
+                ORDER BY MAP_DTE ROWS UNBOUNDED PRECEDING) AS SIGNAL_GROUP
+    FROM SIGNAL_PREVIOUS s
+),
+SIGNALS AS (
+    SELECT INDICATOR,PREDICTOR_A,PREDICTOR_B,THRESHOLD_A,THRESHOLD_B,
+           ENTITY_ID,MIN(MAP_DTE) AS SIGNAL_START
+    FROM SIGNAL_GROUPS
+    GROUP BY 1,2,3,4,5,6,SIGNAL_GROUP
+),
+EVENT_MAX_GEC AS (
+    SELECT e.EVENT_ID,e.EVENT_EXPOSURE,MAX(p.GEC_EXPOSURE) AS MAX_LEAD_GEC
+    FROM EVENTS e
+    JOIN PREP p ON p.ENTITY_ID=e.ENTITY_ID AND p.TARGET_SCOPE='DPD'
+      AND p.MAP_DTE BETWEEN DATEADD(month,-{lead_hi},e.EVENT_START)
+                         AND DATEADD(month,-{lead_lo},e.EVENT_START)
+    WHERE e.TARGET_SCOPE='DPD' AND p.TARGET=0 AND p.GEC_EXPOSURE IS NOT NULL
+    GROUP BY 1,2
+),
+INDICATOR_EVENTS AS (
+    SELECT DISTINCT f.PREDICTOR AS INDICATOR,
+           CAST(NULL AS DOUBLE) AS EXPOSURE_CUTOFF,e.EVENT_ID,e.EVENT_EXPOSURE
+    FROM EVENTS e
+    JOIN FLAT_FEATURES f ON f.ENTITY_ID=e.ENTITY_ID
+      AND f.TARGET_SCOPE=e.TARGET_SCOPE
+      AND f.MAP_DTE BETWEEN DATEADD(month,-{lead_hi},e.EVENT_START)
+                         AND DATEADD(month,-{lead_lo},e.EVENT_START)
+    WHERE e.TARGET_SCOPE='RATING' AND f.TARGET=0
+    UNION ALL
+    {rating_pair_eligible}
+    UNION ALL
+    SELECT '{gec_indicator}' AS INDICATOR,g.THRESHOLD AS EXPOSURE_CUTOFF,
+           e.EVENT_ID,e.EVENT_EXPOSURE
+    FROM EVENT_MAX_GEC e JOIN GRID_GEC g ON e.MAX_LEAD_GEC>=g.THRESHOLD
+),
+EVENT_COUNTS AS (
+    SELECT INDICATOR,EXPOSURE_CUTOFF,COUNT(DISTINCT EVENT_ID) AS N_EVENTS,
+           SUM(EVENT_EXPOSURE) AS SUM_GCA_EVENTS
+    FROM INDICATOR_EVENTS GROUP BY 1,2
+),
+VALID_PAIRS AS (
+    SELECT s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B,
+           s.ENTITY_ID,s.SIGNAL_START,e.EVENT_ID,e.EVENT_START,e.EVENT_EXPOSURE,
+           IFF(s.INDICATOR='{gec_indicator}',s.THRESHOLD_B,NULL) AS EXPOSURE_CUTOFF
+    FROM SIGNALS s
+    JOIN EVENTS e ON e.ENTITY_ID=s.ENTITY_ID
+      AND e.TARGET_SCOPE=IFF(s.INDICATOR='{gec_indicator}','DPD','RATING')
+      AND s.SIGNAL_START BETWEEN DATEADD(month,-{lead_hi},e.EVENT_START)
+                             AND DATEADD(month,-{lead_lo},e.EVENT_START)
+    JOIN INDICATOR_EVENTS ie ON ie.INDICATOR=s.INDICATOR
+      AND ie.EVENT_ID=e.EVENT_ID
+      AND EQUAL_NULL(ie.EXPOSURE_CUTOFF,
+          IFF(s.INDICATOR='{gec_indicator}',s.THRESHOLD_B,NULL))
+),
+FIRST_MATCH AS (
+    SELECT * FROM VALID_PAIRS
+    QUALIFY ROW_NUMBER() OVER(
+        PARTITION BY INDICATOR,THRESHOLD_A,THRESHOLD_B,EVENT_ID
+        ORDER BY SIGNAL_START)=1
+),
+TP AS (
+    SELECT INDICATOR,THRESHOLD_A,THRESHOLD_B,
+           COUNT(*) AS N_TP,
+           SUM(EVENT_EXPOSURE) AS SUM_GCA_TP,
+           SUM(EVENT_EXPOSURE*(
+             {cost_tp_late} + ({cost_tp_early}-{cost_tp_late})*
+             (LEAST({lead_hi},GREATEST({lead_lo},
+                DATEDIFF(day,SIGNAL_START,EVENT_START)/(365.25/12.0)))-{lead_lo})
+             /({lead_hi}-{lead_lo})
+           )) AS SUM_GCA_TP_WTD
+    FROM FIRST_MATCH GROUP BY 1,2,3
+),
+DETECTED AS (
+    SELECT INDICATOR,EXPOSURE_CUTOFF,
+           COUNT(DISTINCT EVENT_ID) AS N_EVENTS_DETECTABLE
+    FROM VALID_PAIRS GROUP BY 1,2
+),
+MATCHED_SIGNALS AS (
+    SELECT DISTINCT INDICATOR,THRESHOLD_A,THRESHOLD_B,ENTITY_ID,SIGNAL_START
+    FROM VALID_PAIRS
+),
+SIGNAL_COUNTS AS (
+    SELECT s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B,
+           COUNT(*) AS N_SIGNALS,
+           COUNT_IF(m.SIGNAL_START IS NULL) AS N_FP
+    FROM SIGNALS s LEFT JOIN MATCHED_SIGNALS m
+      ON s.INDICATOR=m.INDICATOR AND s.THRESHOLD_A=m.THRESHOLD_A
+     AND EQUAL_NULL(s.THRESHOLD_B,m.THRESHOLD_B)
+     AND s.ENTITY_ID=m.ENTITY_ID AND s.SIGNAL_START=m.SIGNAL_START
+    GROUP BY 1,2,3
+),
+SIGNAL_MONTHS AS (
+    SELECT INDICATOR,THRESHOLD_A,THRESHOLD_B,
+           DATE_TRUNC(month,SIGNAL_START) AS SIGNAL_MONTH,
+           COUNT(*) AS N_MONTHLY_SIGNALS
+    FROM SIGNALS GROUP BY 1,2,3,4
+),
+MONTHLY_MAX AS (
+    SELECT INDICATOR,THRESHOLD_A,THRESHOLD_B,
+           MAX(N_MONTHLY_SIGNALS) AS MAX_MONTHLY_SIGNALS
+    FROM SIGNAL_MONTHS GROUP BY 1,2,3
+),
+SIGNAL_DAYS AS (
+    SELECT INDICATOR,THRESHOLD_A,THRESHOLD_B,
+           SIGNAL_START,COUNT(*) AS N_DAILY_SIGNALS
+    FROM SIGNALS GROUP BY 1,2,3,4
+),
+DAILY_MAX AS (
+    SELECT INDICATOR,THRESHOLD_A,THRESHOLD_B,
+           MAX(N_DAILY_SIGNALS) AS MAX_DAILY_SIGNALS
+    FROM SIGNAL_DAYS GROUP BY 1,2,3
+),
+SCOPE_COUNTS AS (
+    SELECT TARGET_SCOPE,COUNT(DISTINCT ENTITY_ID) AS N_ENTITIES,
+           GREATEST(COUNT(DISTINCT DATE_TRUNC(month,MAP_DTE)),1) AS N_MONTHS,
+           GREATEST(COUNT(DISTINCT MAP_DTE),1) AS N_DAYS
+    FROM PREP WHERE TARGET=0 GROUP BY TARGET_SCOPE
+),
+METRICS AS (
+    SELECT g.INDICATOR,g.PREDICTOR_A,g.PREDICTOR_B,
+           g.THRESHOLD_A,g.THRESHOLD_B,
+           c.N_ENTITIES,
+           COALESCE(t.N_TP,0) AS N_TP,
+           COALESCE(s.N_FP,0) AS N_FP,
+           GREATEST(COALESCE(e.N_EVENTS,0)-COALESCE(t.N_TP,0),0) AS N_FN,
+           COALESCE(t.N_TP,0)+COALESCE(s.N_FP,0) AS N_ALERTS,
+           COALESCE(s.N_SIGNALS,0) AS N_SIGNALS,
+           COALESCE(e.N_EVENTS,0) AS N_EVENTS,
+           COALESCE(d.N_EVENTS_DETECTABLE,0) AS N_EVENTS_DETECTABLE,
+           COALESCE(t.SUM_GCA_TP,0) AS SUM_GCA_TP,
+           COALESCE(t.SUM_GCA_TP_WTD,0) AS SUM_GCA_TP_WTD,
+           GREATEST(COALESCE(e.SUM_GCA_EVENTS,0)-COALESCE(t.SUM_GCA_TP,0),0) AS SUM_GCA_FN,
+           COALESCE(mm.MAX_MONTHLY_SIGNALS,0) AS MAX_MONTHLY_ALERTS,
+           COALESCE(dm.MAX_DAILY_SIGNALS,0) AS MAX_DAILY_ALERTS,
+           c.N_MONTHS,c.N_DAYS
+    FROM GRID_ALL g
+    LEFT JOIN SCOPE_COUNTS c ON c.TARGET_SCOPE=
+      IFF(g.INDICATOR='{gec_indicator}','DPD','RATING')
+    LEFT JOIN TP t ON t.INDICATOR=g.INDICATOR
+      AND t.THRESHOLD_A=g.THRESHOLD_A
+      AND EQUAL_NULL(t.THRESHOLD_B,g.THRESHOLD_B)
+    LEFT JOIN SIGNAL_COUNTS s ON s.INDICATOR=g.INDICATOR
+      AND s.THRESHOLD_A=g.THRESHOLD_A
+      AND EQUAL_NULL(s.THRESHOLD_B,g.THRESHOLD_B)
+    LEFT JOIN EVENT_COUNTS e ON e.INDICATOR=g.INDICATOR
+      AND EQUAL_NULL(e.EXPOSURE_CUTOFF,
+          IFF(g.INDICATOR='{gec_indicator}',g.THRESHOLD_B,NULL))
+    LEFT JOIN DETECTED d ON d.INDICATOR=g.INDICATOR
+      AND EQUAL_NULL(d.EXPOSURE_CUTOFF,
+          IFF(g.INDICATOR='{gec_indicator}',g.THRESHOLD_B,NULL))
+    LEFT JOIN MONTHLY_MAX mm ON mm.INDICATOR=g.INDICATOR
+      AND mm.THRESHOLD_A=g.THRESHOLD_A
+      AND EQUAL_NULL(mm.THRESHOLD_B,g.THRESHOLD_B)
+    LEFT JOIN DAILY_MAX dm ON dm.INDICATOR=g.INDICATOR
+      AND dm.THRESHOLD_A=g.THRESHOLD_A
+      AND EQUAL_NULL(dm.THRESHOLD_B,g.THRESHOLD_B)
+),
+COSTED AS (
+    SELECT m.*,
+           {cost_tp_fixed}*N_TP + {cost_fp}*N_FP
+              + SUM_GCA_TP_WTD + {cost_fn_pct}*SUM_GCA_FN AS TOTAL_COST,
+           IFF(N_ALERTS>0,N_TP/N_ALERTS,NULL) AS ACCURACY,
+           IFF(N_EVENTS>0,N_TP/N_EVENTS,NULL) AS COVERAGE,
+           IFF(N_EVENTS_DETECTABLE>0,N_TP/N_EVENTS_DETECTABLE,NULL) AS COVERAGE_2,
+           IFF(MAX(N_TP) OVER(PARTITION BY INDICATOR,
+               IFF(INDICATOR='{gec_indicator}',THRESHOLD_B,NULL))>0,
+               N_TP/MAX(N_TP) OVER(PARTITION BY INDICATOR,
+               IFF(INDICATOR='{gec_indicator}',THRESHOLD_B,NULL)),NULL) AS COVERAGE_3
+    FROM METRICS m
+),
+FINAL AS (
+    SELECT m.*,
+           ROW_NUMBER() OVER(PARTITION BY INDICATOR
+             ORDER BY TOTAL_COST ASC,THRESHOLD_A ASC,THRESHOLD_B ASC NULLS FIRST) AS COST_RANK,
+           ROW_NUMBER() OVER(PARTITION BY INDICATOR,
+                    IFF(INDICATOR='{gec_indicator}',THRESHOLD_B,NULL)
+             ORDER BY TOTAL_COST ASC,THRESHOLD_A ASC) AS COST_RANK_AT_GEC,
+           MAX(N_TP) OVER(PARTITION BY INDICATOR,
+                    IFF(INDICATOR='{gec_indicator}',THRESHOLD_B,NULL)) AS N_EVENTS_REACHABLE
+    FROM COSTED m
+)
+SELECT
+    INDICATOR,PREDICTOR_A,PREDICTOR_B,N_ENTITIES,THRESHOLD_A,THRESHOLD_B,
+    {rating_a_sql} AS THRESHOLD_A_RATING_LABEL,
+    {rating_b_sql} AS THRESHOLD_B_RATING_LABEL,
+    IFF(INDICATOR='{gec_indicator}',THRESHOLD_B,NULL) AS GEC_EXPOSURE_THRESHOLD,
+    IFF(INDICATOR='{gec_indicator}','EXCLUDING_DPD_COMPONENT','RETAIL_FIVE_COMPONENTS') AS TARGET_DEFINITION,
+    N_TP,N_FP,N_FN,N_ALERTS,N_SIGNALS,MAX_MONTHLY_ALERTS,MAX_DAILY_ALERTS,
+    N_EVENTS,N_EVENTS_DETECTABLE,N_EVENTS_REACHABLE,
+    ROUND(ACCURACY,3) AS ACCURACY,
+    ROUND(COVERAGE,3) AS COVERAGE,
+    ROUND(COVERAGE_2,3) AS COVERAGE_2,
+    ROUND(COVERAGE_3,3) AS COVERAGE_3,
+    SUM_GCA_TP,SUM_GCA_TP_WTD,SUM_GCA_FN,
+    ROUND(TOTAL_COST,2) AS TOTAL_COST,
+    IFF(COST_RANK=1,TRUE,FALSE) AS OPTIMAL,
+    IFF(COST_RANK_AT_GEC=1,TRUE,FALSE) AS OPTIMAL_AT_GEC,
+    CAST(NULL AS DOUBLE) AS SUM_COST2_TP,
+    CAST(NULL AS DOUBLE) AS SUM_COST2_FN,
+    CAST(NULL AS DOUBLE) AS TOTAL_COST_2,
+    CAST(NULL AS BOOLEAN) AS OPTIMAL_COST_2,
+    ROUND(N_ALERTS/N_MONTHS,0) AS AV_NR_MON_ALERTS,
+    ROUND(N_ALERTS/N_MONTHS,0) AS AV_EXP_NR_MON_ALERTS,
+    ROUND(MAX_MONTHLY_ALERTS,0) AS MAX_EXP_NR_MON_ALERTS,
+    ROUND(N_ALERTS/N_DAYS,3) AS AV_NR_DAY_ALERTS,
+    IFF(INDICATOR='{gec_indicator}','GEC_NOMINAL_CANDIDATE','OWN_NOMINAL_COMPLETE') AS EXPOSURE_BASIS,
+    CASE WHEN N_EVENTS=0 THEN 'NO_HISTORICAL_EVENTS'
+         WHEN N_SIGNALS=0 THEN 'NO_HISTORICAL_SIGNALS'
+         ELSE 'REVIEW_REQUIRED' END AS CALIBRATION_STATUS
+FROM FINAL m
+""".format(
+    SOURCE=SOURCE,
+    event_gap=MAX_GAP_MONTHS,
+    lead_hi=MAX_LEAD_MONTHS,
+    lead_lo=MIN_LEAD_MONTHS,
+    signal_gap=MAX_SIGNAL_GAP_MONTHS,
+    min_exposure=MIN_EXPOSURE,
+    single_fields=single_fields,
+    previous_fields=previous_fields.replace('PARTITION BY ENTITY_ID', 'PARTITION BY TARGET_SCOPE,ENTITY_ID'),
+    grid_values=grid_values,
+    gec_grid_values=GEC_GRID_VALUES,
+    gec_indicator=GEC_INDICATOR,
+    pair_grids=pair_grids,
+    previous_choice=previous_choice,
+    active_grid_names=active_grid_names,
+    pair_starts_sql=pair_starts_sql,
+    rating_pair_eligible=rating_pair_eligible,
+    cost_tp_fixed=COST_TP_FIXED,
+    cost_fp=COST_FP,
+    cost_fn_pct=COST_FN_PCT,
+    cost_tp_late=COST_TP_PCT_LATE,
+    cost_tp_early=COST_TP_PCT_EARLY,
+    rating_a_sql=rating_a_sql,
+    rating_b_sql=rating_b_sql,
+)
+
+output_results = dataiku.Dataset(RESULTS, project_key=PROJECT)
+SQLExecutor2.exec_recipe_fragment(output_results, SQL, overwrite_output_schema=True)
+
+QA_SQL = r"""
+WITH SOURCE_QA AS (
+    SELECT COUNT(*) AS TOTAL_ROWS,
+           COUNT_IF(LOAN_COUNT>0 AND HAS_VALID_ENTITY_HISTORY=1
+             AND DPD_MAX IS NOT NULL) AS MAPPED_DPD_ROWS,
+           COUNT_IF(LOAN_COUNT>0 AND HAS_VALID_ENTITY_HISTORY=1
+             AND DPD_MAX IS NOT NULL
+             AND GEC_NOMINAL_CANDIDATE IS NOT NULL) AS GEC_NOMINAL_AVAILABLE,
+           COUNT_IF(LOAN_COUNT>0 AND HAS_VALID_ENTITY_HISTORY=1
+             AND DPD_MAX IS NOT NULL
+             AND GEC_GCA_CANDIDATE IS NOT NULL) AS GEC_GCA_AVAILABLE,
+           COUNT_IF(LOAN_COUNT>0 AND HAS_VALID_ENTITY_HISTORY=1
+             AND DPD_MAX IS NOT NULL AND TGT_ANY_SAMEDAY IS NULL)
+               AS RETAIL_TARGET_UNKNOWN,
+           COUNT_IF(LOAN_COUNT>0 AND HAS_VALID_ENTITY_HISTORY=1
+             AND DPD_MAX IS NOT NULL AND CLIENT_NOTCH IS NOT NULL)
+               AS CLIENT_RATING_AVAILABLE,
+           COUNT_IF(LOAN_COUNT>0 AND HAS_VALID_ENTITY_HISTORY=1
+             AND DPD_MAX IS NOT NULL AND GCC_NOTCH IS NOT NULL)
+               AS GCC_RATING_AVAILABLE,
+           MAX(IFF(DPD_MAX IS NOT NULL AND LOAN_COUNT>0,
+             TO_DATE(MAP_DTE),NULL)) AS LAST_DPD_DATE,
+           MAX(TO_DATE(MAP_DTE)) AS LAST_TRAINING_DATE
+    FROM {SOURCE}
+),
+RESULT_QA AS (
+    SELECT COUNT(*) AS RESULT_ROWS,
+           COUNT_IF(INDICATOR='{gec_indicator}') AS DPD_GEC_ROWS,
+           COUNT_IF(INDICATOR='{gec_indicator}' AND OPTIMAL_AT_GEC=TRUE) AS DPD_GEC_OPTIMAL_ROWS,
+           COUNT_IF(N_TP+N_FP<>N_ALERTS) AS BAD_ALERT_IDENTITIES,
+           COUNT_IF(N_TP+N_FN<>N_EVENTS) AS BAD_EVENT_IDENTITIES,
+           COUNT_IF(ACCURACY<0 OR ACCURACY>1
+                OR COVERAGE<0 OR COVERAGE>1
+                OR COVERAGE_2<0 OR COVERAGE_2>1
+                OR COVERAGE_3<0 OR COVERAGE_3>1) AS BAD_METRIC_RANGES,
+           COUNT_IF(COVERAGE_2<COVERAGE OR COVERAGE_3<COVERAGE_2) AS BAD_COVERAGE_ORDER,
+           COUNT(DISTINCT INDICATOR) AS INDICATORS,
+           COUNT_IF(OPTIMAL) AS OPTIMAL_ROWS,
+           COUNT_IF(N_EVENTS>0) AS ROWS_WITH_EVENTS
+    FROM {RESULTS_TABLE}
+),
+CHECKS AS (
+    SELECT 'MODEL_CHECK' AS QA_TYPE,'At least one result' AS CHECK_NAME,
+           IFF(r.RESULT_ROWS>0,TRUE,FALSE) AS CHECK_PASSED,
+           r.RESULT_ROWS::DOUBLE AS CHECK_VALUE,1.0 AS EXPECTED_VALUE
+    FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','Full indicator grid complete',
+           IFF(r.RESULT_ROWS=1974,TRUE,FALSE),r.RESULT_ROWS::DOUBLE,1974.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','DPD x GEC grid complete',
+           IFF(r.DPD_GEC_ROWS=240,TRUE,FALSE),r.DPD_GEC_ROWS::DOUBLE,240.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','One DPD optimum at each GEC threshold',
+           IFF(r.DPD_GEC_OPTIMAL_ROWS=20,TRUE,FALSE),r.DPD_GEC_OPTIMAL_ROWS::DOUBLE,20.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','TP+FP equals alerts',
+           IFF(r.BAD_ALERT_IDENTITIES=0,TRUE,FALSE),r.BAD_ALERT_IDENTITIES::DOUBLE,0.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','TP+FN equals events',
+           IFF(r.BAD_EVENT_IDENTITIES=0,TRUE,FALSE),r.BAD_EVENT_IDENTITIES::DOUBLE,0.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','Metrics within 0-1',
+           IFF(r.BAD_METRIC_RANGES=0,TRUE,FALSE),r.BAD_METRIC_RANGES::DOUBLE,0.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','Coverage order',
+           IFF(r.BAD_COVERAGE_ORDER=0,TRUE,FALSE),r.BAD_COVERAGE_ORDER::DOUBLE,0.0 FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','Exactly one optimal per indicator',
+           IFF(r.OPTIMAL_ROWS=r.INDICATORS,TRUE,FALSE),r.OPTIMAL_ROWS::DOUBLE,r.INDICATORS::DOUBLE FROM RESULT_QA r
+    UNION ALL SELECT 'MODEL_CHECK','Historical events available',
+           IFF(r.ROWS_WITH_EVENTS>0,TRUE,FALSE),r.ROWS_WITH_EVENTS::DOUBLE,1.0 FROM RESULT_QA r
+    UNION ALL SELECT 'DATA_QUALITY','Corporate DPD-mapped rows',NULL,
+           s.MAPPED_DPD_ROWS::DOUBLE,NULL FROM SOURCE_QA s
+    UNION ALL SELECT 'DATA_QUALITY','Complete GEC nominal candidate rows',NULL,
+           s.GEC_NOMINAL_AVAILABLE::DOUBLE,NULL FROM SOURCE_QA s
+    UNION ALL SELECT 'DATA_QUALITY','Complete GEC GCA candidate rows',NULL,
+           s.GEC_GCA_AVAILABLE::DOUBLE,NULL FROM SOURCE_QA s
+    UNION ALL SELECT 'DATA_QUALITY','Retail target unknown rows',NULL,
+           s.RETAIL_TARGET_UNKNOWN::DOUBLE,NULL FROM SOURCE_QA s
+    UNION ALL SELECT 'DATA_QUALITY','Client rating available rows',NULL,
+           s.CLIENT_RATING_AVAILABLE::DOUBLE,NULL FROM SOURCE_QA s
+    UNION ALL SELECT 'DATA_QUALITY','GCC rating available rows',NULL,
+           s.GCC_RATING_AVAILABLE::DOUBLE,NULL FROM SOURCE_QA s
+    UNION ALL SELECT 'DATA_QUALITY','GEC nominal completeness share in mapped DPD rows',NULL,
+           IFF(s.MAPPED_DPD_ROWS>0,s.GEC_NOMINAL_AVAILABLE/s.MAPPED_DPD_ROWS,NULL),NULL
+           FROM SOURCE_QA s
+    UNION ALL SELECT 'METHODOLOGY','DPD 5-60 in 5-day steps',TRUE,12.0,12.0 FROM SOURCE_QA
+    UNION ALL SELECT 'METHODOLOGY','GEC exposure 50k-1m in 50k steps',TRUE,20.0,20.0 FROM SOURCE_QA
+    UNION ALL SELECT 'METHODOLOGY','1-11 month lead window',TRUE,1.0,1.0 FROM SOURCE_QA
+    UNION ALL SELECT 'METHODOLOGY','3-month event grouping',TRUE,3.0,3.0 FROM SOURCE_QA
+    UNION ALL SELECT 'METHODOLOGY','2-month signal merging',TRUE,2.0,2.0 FROM SOURCE_QA
+    UNION ALL SELECT 'BUSINESS_REVIEW','GEC nominal candidate requires bank reconciliation',NULL,NULL,NULL FROM SOURCE_QA
+    UNION ALL SELECT 'BUSINESS_REVIEW','Mortgage exclusions require source-level verification',NULL,NULL,NULL FROM SOURCE_QA
+    UNION ALL SELECT 'BUSINESS_REVIEW','Default DIM1 and forbearance codes require validation',NULL,NULL,NULL FROM SOURCE_QA
+    UNION ALL SELECT 'BUSINESS_REVIEW','Collateral-adjusted cost not computed',NULL,NULL,NULL FROM SOURCE_QA
+    UNION ALL SELECT 'BUSINESS_REVIEW','DPD target excludes DPD component to prevent circularity',NULL,NULL,NULL FROM SOURCE_QA
+),
+BEST AS (
+    SELECT INDICATOR,PREDICTOR_A,PREDICTOR_B,THRESHOLD_A,THRESHOLD_B,
+           N_ALERTS,AV_NR_MON_ALERTS,AV_EXP_NR_MON_ALERTS,MAX_EXP_NR_MON_ALERTS,
+           ACCURACY,COVERAGE,COVERAGE_2,COVERAGE_3,TOTAL_COST
+    FROM {RESULTS_TABLE} WHERE OPTIMAL=TRUE
+)
+SELECT c.QA_TYPE,c.CHECK_NAME,
+       CAST(NULL AS VARCHAR) AS INDICATOR,
+       CAST(NULL AS VARCHAR) AS PREDICTOR_A,
+       CAST(NULL AS VARCHAR) AS PREDICTOR_B,
+       CAST(NULL AS VARCHAR) AS UNAVAILABLE_COLUMNS,
+       CAST(NULL AS VARCHAR) AS ENTITY_ID,
+       CAST(NULL AS DATE) AS MAP_DTE,
+       CAST(NULL AS VARCHAR) AS SIGNAL_LOGIC,
+       CAST(NULL AS VARCHAR) AS DIRECTION,
+       CAST(NULL AS DOUBLE) AS THRESHOLD_A,
+       CAST(NULL AS DOUBLE) AS THRESHOLD_B,
+       CAST(NULL AS DOUBLE) AS PREDICTOR_VALUE,
+       CAST(NULL AS DOUBLE) AS PREVIOUS_VALUE,
+       CAST(NULL AS BOOLEAN) AS ALERT_GENERATED,
+       c.CHECK_PASSED,c.CHECK_VALUE,c.EXPECTED_VALUE,
+       CAST(NULL AS NUMBER) AS N_ALERTS,
+       CAST(NULL AS DOUBLE) AS AV_NR_MON_ALERTS,
+       CAST(NULL AS DOUBLE) AS AV_EXP_NR_MON_ALERTS,
+       CAST(NULL AS DOUBLE) AS MAX_EXP_NR_MON_ALERTS,
+       CAST(NULL AS DOUBLE) AS ACCURACY,
+       CAST(NULL AS DOUBLE) AS COVERAGE,
+       CAST(NULL AS DOUBLE) AS COVERAGE_2,
+       CAST(NULL AS DOUBLE) AS COVERAGE_3,
+       CAST(NULL AS DOUBLE) AS TOTAL_COST
+FROM CHECKS c
+UNION ALL
+SELECT 'OPTIMAL_THRESHOLD',CAST(NULL AS VARCHAR),
+       b.INDICATOR,b.PREDICTOR_A,b.PREDICTOR_B,
+       CAST(NULL AS VARCHAR),CAST(NULL AS VARCHAR),CAST(NULL AS DATE),
+       CAST(NULL AS VARCHAR),CAST(NULL AS VARCHAR),
+       b.THRESHOLD_A,b.THRESHOLD_B,
+       CAST(NULL AS DOUBLE),CAST(NULL AS DOUBLE),CAST(NULL AS BOOLEAN),
+       CAST(NULL AS BOOLEAN),CAST(NULL AS DOUBLE),CAST(NULL AS DOUBLE),
+       b.N_ALERTS,b.AV_NR_MON_ALERTS,b.AV_EXP_NR_MON_ALERTS,
+       b.MAX_EXP_NR_MON_ALERTS,b.ACCURACY,b.COVERAGE,b.COVERAGE_2,
+       b.COVERAGE_3,b.TOTAL_COST
+FROM BEST b
+""".format(SOURCE=SOURCE,RESULTS_TABLE=TARGET_TABLE,gec_indicator=GEC_INDICATOR)
+
+output_tests = dataiku.Dataset(TEST_RESULTS, project_key=PROJECT)
+SQLExecutor2.exec_recipe_fragment(output_tests, QA_SQL, overwrite_output_schema=True)
+print('Corporate B01 DPD/Rating calibration completed.')

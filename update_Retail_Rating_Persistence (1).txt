@@ -1,0 +1,154 @@
+# -*- coding: utf-8 -*-
+# Run in a notebook in the Retail implementation project.
+# Update only the existing Current and Previous indicator recipes.
+import ast
+import re
+import dataiku
+
+TARGETS = {"Available_Indicators_Current", "Available_Indicators_Previous"}
+PARAMETER = "RATING_PERSISTENCE_BUSINESS_DAYS"
+project = dataiku.api_client().get_project(dataiku.default_project_key())
+
+
+def written_datasets(code):
+    """Identify literal dataset writes, including simple output variables."""
+    tree = ast.parse(code)
+    literals, datasets = {}, {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name):
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    literals[target.id] = node.value.value
+
+    def dataset_name(node):
+        if not isinstance(node, ast.Call):
+            return None
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and fn.attr == "Dataset"):
+            return None
+        arg = node.args[0] if node.args else next(
+            (k.value for k in node.keywords if k.arg == "name"), None)
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, ast.Name):
+            return literals.get(arg.id)
+        return None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            name = dataset_name(node.value)
+            if name:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        datasets[target.id] = name
+
+    outputs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in {"write_with_schema", "write_dataframe", "get_writer"}:
+                receiver = node.func.value
+                name = (datasets.get(receiver.id) if isinstance(receiver, ast.Name)
+                        else dataset_name(receiver))
+                if name:
+                    outputs.add(name.split(".")[-1])
+    return outputs
+
+
+def update_code(code, name):
+    # Require the existing history-based persistence logic, not an alert-only comparison.
+    tree = ast.parse(code)
+    funcs = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+             and n.name == "build_rating_persistence_flags"]
+    if len(funcs) != 1:
+        raise RuntimeError("Expected rating persistence function missing: " + name)
+    fn = ast.get_source_segment(code, funcs[0]) or ""
+    if not re.search(r"periods\s*=\s*RATING_PERSISTENCE_BUSINESS_DAYS\s*\+\s*1", fn):
+        raise RuntimeError("Unexpected rating history window: " + name)
+    if not all(x in fn for x in ("persistence_dates", "complete_history", "persisted", "matured")):
+        raise RuntimeError("Unexpected persistence logic: " + name)
+    pattern = r"(?m)^(\s*RATING_PERSISTENCE_BUSINESS_DAYS\s*=\s*)(5|10)(?=\s*(?:#|$))"
+    if len(list(re.finditer(pattern, code))) != 1:
+        raise RuntimeError("Expected a single 5/10-day persistence parameter: " + name)
+    updated = re.sub(pattern, lambda m: m.group(1) + "10", code)
+    updated = re.sub(r"\bMATURED_DAY_5\b", "MATURED_DAY_10", updated)
+    updated = re.sub(r"\bDay 5\b", "Day 10", updated)
+    updated = re.sub(r"\bfive-day\b", "ten-business-day", updated)
+    updated = re.sub(r"(?m)^(\s*#.*)\bfive\b", lambda m: m.group(1) + "ten", updated)
+    updated = re.sub(r"(?m)^# -+ NOTEBOOK-CELL: CODE\s*\n", "", updated)
+    compile(updated, name, "exec")
+    if written_datasets(updated) != written_datasets(code):
+        raise RuntimeError("Output changed unexpectedly: " + name)
+    return updated
+
+
+# Discover both existing recipes by the datasets they actually write.
+found = {}
+for item in project.list_recipes():
+    if item.get("type") and str(item["type"]).lower() != "python":
+        continue
+    name = item["name"]
+    try:
+        settings = project.get_recipe(name).get_settings()
+        code = settings.get_code()
+    except (AttributeError, NotImplementedError):
+        continue
+    if not isinstance(code, str) or PARAMETER not in code:
+        continue
+    if not any(target in code for target in TARGETS):
+        continue
+    try:
+        outputs = written_datasets(code)
+    except SyntaxError:
+        continue
+    matches = TARGETS.intersection(outputs)
+    if not matches:
+        continue
+    if len(matches) != 1 or len(outputs) != 1:
+        raise RuntimeError("Ambiguous indicator recipe outputs: " + name)
+    output = next(iter(matches))
+    if output in found:
+        raise RuntimeError("Multiple recipes write " + output)
+    found[output] = (name, settings, code)
+
+if set(found) != TARGETS:
+    raise RuntimeError("Could not identify both original indicator recipes. Found: "
+                       + ", ".join(sorted(found)) + ". No changes made.")
+
+# Prepare and compile both before saving either one.
+original_recipes = {output: values[2] for output, values in found.items()}
+updated_recipes = {output: update_code(values[2], values[0])
+                   for output, values in found.items()}
+
+# Keep the original code in the notebook session for recovery.
+# Do not change inputs, outputs, dates, thresholds or alert priorities.
+attempted = []
+try:
+    for output in sorted(TARGETS):
+        name, settings, old = found[output]
+        if updated_recipes[output] == old:
+            continue
+        fresh = project.get_recipe(name).get_settings()
+        if fresh.get_code() != old:
+            raise RuntimeError("Recipe changed during preparation: " + name)
+        attempted.append(output)
+        fresh.set_code(updated_recipes[output])
+        fresh.save()
+        if project.get_recipe(name).get_settings().get_code() != updated_recipes[output]:
+            raise RuntimeError("Saved code could not be verified: " + name)
+except Exception:
+    for output in reversed(attempted):
+        name = found[output][0]
+        try:
+            fresh = project.get_recipe(name).get_settings()
+            if fresh.get_code() == updated_recipes[output]:
+                fresh.set_code(original_recipes[output])
+                fresh.save()
+        except Exception as rollback_error:
+            print("RESTORE REQUIRED |", name, str(rollback_error))
+    raise
+
+for output in sorted(TARGETS):
+    print("READY |", found[output][0], "->", output, "| persistence = 10 business days")
+print("FINISHED | Both indicator recipes updated. Alerts unchanged.")
+# Full updated code is also available in updated_recipes[output].

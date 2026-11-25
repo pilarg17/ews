@@ -1,0 +1,163 @@
+# Corporate Payments | Read-only source lineage and 12M vs preceding 12M screening.
+# No recipe or dataset is created, rebuilt or modified.
+import re
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION = 'DEV_AA_TEAMS'
+END_DATE = '2026-10-29'
+project = dataiku.api_client().get_project(PROJECT)
+known = {d['name'] for d in project.list_datasets()}
+roots = {'payment_signals_Corporate', 'payment_movements_monthly_Corporate',
+         'payment_movements_signals_Corporate'}
+
+def refs(obj):
+    if isinstance(obj, dict):
+        if isinstance(obj.get('ref'), str):
+            yield obj['ref'].split('.')[-1]
+        for v in obj.values():
+            yield from refs(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from refs(v)
+
+def qi(s):
+    s = str(s).replace('${projectKey}', PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9$]*', s):
+        raise RuntimeError('Invalid physical identifier: '+s)
+    return '"'+s+'"'
+
+print('START | PAYMENTS SOURCE LINEAGE | READ ONLY', flush=True)
+recipes = {}
+for r in project.list_recipes():
+    name = r['name']
+    if not any(k in name.lower() for k in ('payment', 'turnover', 'movement', 'transaction', 'top')):
+        # The API list may already expose role references for differently named producers.
+        if not (set(refs(r.get('outputs', {}))) & roots):
+            continue
+    if name.startswith('compute_results_'):
+        continue
+    try:
+        settings = project.get_recipe(name).get_settings()
+        raw = settings.get_raw()
+        # Recipe settings may have roles at the top level or under the recipe definition.
+        body = raw.get('recipe', raw)
+        inputs = set(refs(body.get('inputs', {})))
+        outputs = set(refs(body.get('outputs', {})))
+        try:
+            code = settings.get_code()
+        except (AttributeError, TypeError):
+            code = None
+        recipes[name] = (inputs, outputs, code)
+    except Exception as exc:
+        print('RECIPE READ WARNING |', name, str(exc)[:180], flush=True)
+
+# Follow payment-related producers upstream, and print their complete code, never execute it.
+needed = set(roots)
+selected = set()
+for _ in range(len(recipes)+1):
+    old = len(selected)
+    for name, (inputs, outputs, code) in recipes.items():
+        if outputs & needed:
+            selected.add(name)
+            needed.update(inputs)
+    if len(selected) == old:
+        break
+# Compatibility fallback for installations not exposing output roles in get_raw().
+if not selected:
+    selected = set(recipes)
+    print('WARNING | Output roles not found; showing payment-related recipe code instead.')
+for name in sorted(selected):
+    inputs, outputs, code = recipes[name]
+    print('\n=== RECIPE | '+name+' ===', flush=True)
+    print('INPUTS:', sorted(inputs), 'OUTPUTS:', sorted(outputs), flush=True)
+    print(code if code else 'No code exposed; inspect this recipe in Flow.', flush=True)
+
+print('\n=== SOURCE SCHEMAS ===', flush=True)
+for name in sorted((needed | roots) & known):
+    try:
+        columns = dataiku.Dataset(name, project_key=PROJECT).read_schema()
+        print(name, '|', ', '.join(c['name'] for c in columns), flush=True)
+    except Exception as exc:
+        print(name, '| schema unavailable:', str(exc)[:150], flush=True)
+
+print('\nSTART | 12M VS PREVIOUS 12M | SOURCE QA', flush=True)
+name = 'payment_movements_monthly_Corporate'
+if name not in known:
+    raise RuntimeError('Missing source '+name)
+params = project.get_dataset(name).get_settings().get_raw()['params']
+if params.get('connection') != CONNECTION:
+    raise RuntimeError('Unexpected source connection')
+M = qi(params['schema'])+'.'+qi(params['table'])
+cols = {c['name'].upper() for c in dataiku.Dataset(name, project_key=PROJECT).read_schema()}
+required = {'ENTITY_ID','PAYMENT_MONTH','AVAILABLE_DATE','INCOMING_EUR','OUTGOING_EUR'}
+if required-cols:
+    raise RuntimeError('Missing fields: '+str(sorted(required-cols)))
+engine = SQLExecutor2(connection=CONNECTION)
+qa = engine.query_to_df(f'''SELECT DATE_TRUNC('MONTH',TO_DATE(PAYMENT_MONTH)) PAYMENT_MONTH,
+ COUNT(*) N_ROWS, COUNT(DISTINCT ENTITY_ID) N_ENTITIES,
+ COUNT_IF(INCOMING_EUR IS NULL) N_NULL_IN,
+ COUNT_IF(OUTGOING_EUR IS NULL) N_NULL_OUT,
+ COUNT_IF(TRY_TO_DOUBLE(INCOMING_EUR::VARCHAR)<0) N_NEG_IN,
+ COUNT_IF(TRY_TO_DOUBLE(OUTGOING_EUR::VARCHAR)<0) N_NEG_OUT,
+ COUNT_IF(AVAILABLE_DATE IS NULL OR TO_DATE(AVAILABLE_DATE)<LAST_DAY(TO_DATE(PAYMENT_MONTH))) N_BAD_AVAILABLE_DATE,
+ MIN(TO_DATE(AVAILABLE_DATE)) FIRST_AVAILABLE_DATE,
+ MAX(TO_DATE(AVAILABLE_DATE)) LAST_AVAILABLE_DATE
+ FROM {M} GROUP BY 1 ORDER BY 1''')
+print(qa.to_string(index=False), flush=True)
+if qa.empty:
+    raise RuntimeError('No monthly payment rows')
+if qa[['N_NEG_IN','N_NEG_OUT']].fillna(0).sum().sum()>0:
+    raise RuntimeError('Negative payment amounts detected. Confirm sign convention before decline calculation.')
+# Do not infer zero movements for an absent month or an incomplete value.
+complete = "AND UPPER(TRIM(IS_SOURCE_COMPLETE::VARCHAR)) IN ('TRUE','1','Y')" if 'IS_SOURCE_COMPLETE' in cols else ''
+q=f'''
+WITH RAW_PAY AS (
+ SELECT TRIM(ENTITY_ID::VARCHAR) ENTITY_ID,
+  DATE_TRUNC('MONTH',TO_DATE(PAYMENT_MONTH)) PAYMENT_MONTH,
+  TO_DATE(AVAILABLE_DATE) AVAILABLE_DATE,
+  TRY_TO_DOUBLE(INCOMING_EUR::VARCHAR) INCOMING_EUR,
+  TRY_TO_DOUBLE(OUTGOING_EUR::VARCHAR) OUTGOING_EUR,
+  IFF(AVAILABLE_DATE IS NOT NULL AND TO_DATE(AVAILABLE_DATE)>=LAST_DAY(TO_DATE(PAYMENT_MONTH)) {complete},1,0) VALID_OBS
+ FROM {M} WHERE ENTITY_ID IS NOT NULL AND PAYMENT_MONTH IS NOT NULL
+), MONTHLY AS (
+ SELECT ENTITY_ID,PAYMENT_MONTH,
+  IFF(COUNT(*)=1 AND MIN(VALID_OBS)=1,MIN(INCOMING_EUR),NULL) INCOMING_EUR,
+  IFF(COUNT(*)=1 AND MIN(VALID_OBS)=1,MIN(OUTGOING_EUR),NULL) OUTGOING_EUR,
+  IFF(COUNT(*)=1 AND MIN(VALID_OBS)=1,MIN(AVAILABLE_DATE),NULL) AVAILABLE_DATE
+ FROM RAW_PAY GROUP BY 1,2
+), ROLL AS (
+ SELECT *,
+  MIN(PAYMENT_MONTH) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) FIRST_MONTH,
+  COUNT(*) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) N_MONTHS,
+  COUNT(INCOMING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) N_IN,
+  COUNT(OUTGOING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) N_OUT,
+  MAX(AVAILABLE_DATE) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) WINDOW_AVAILABLE_DATE,
+  SUM(INCOMING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) IN_CURRENT,
+  SUM(INCOMING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND 12 PRECEDING) IN_PRIOR,
+  SUM(OUTGOING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) OUT_CURRENT,
+  SUM(OUTGOING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND 12 PRECEDING) OUT_PRIOR
+ FROM MONTHLY
+), RATIOS AS (
+ SELECT ENTITY_ID,PAYMENT_MONTH,WINDOW_AVAILABLE_DATE,
+  IFF(N_MONTHS=24 AND DATEDIFF('MONTH',FIRST_MONTH,PAYMENT_MONTH)=23 AND N_IN=24 AND IN_PRIOR>0,
+    100*(IN_PRIOR-IN_CURRENT)/NULLIF(IN_PRIOR,0),NULL) IN_DECLINE_PCT,
+  IFF(N_MONTHS=24 AND DATEDIFF('MONTH',FIRST_MONTH,PAYMENT_MONTH)=23 AND N_OUT=24 AND OUT_PRIOR>0,
+    100*(OUT_PRIOR-OUT_CURRENT)/NULLIF(OUT_PRIOR,0),NULL) OUT_DECLINE_PCT
+ FROM ROLL
+)
+SELECT PAYMENT_MONTH,COUNT(*) N_ENTITY_MONTHS,
+ COUNT(IN_DECLINE_PCT) N_COMPARABLE_IN,
+ COUNT(OUT_DECLINE_PCT) N_COMPARABLE_OUT,
+ COUNT_IF(IN_DECLINE_PCT>25) N_IN_DECLINE_GT25,
+ COUNT_IF(OUT_DECLINE_PCT>25) N_OUT_DECLINE_GT25,
+ COUNT_IF(IN_DECLINE_PCT IS NOT NULL AND WINDOW_AVAILABLE_DATE<DATEADD('MONTH',-1,DATE '{END_DATE}')) N_IN_BEFORE_LEAD_CUTOFF,
+ COUNT_IF(OUT_DECLINE_PCT IS NOT NULL AND WINDOW_AVAILABLE_DATE<DATEADD('MONTH',-1,DATE '{END_DATE}')) N_OUT_BEFORE_LEAD_CUTOFF,
+ COUNT_IF(IN_DECLINE_PCT>25 AND WINDOW_AVAILABLE_DATE<DATEADD('MONTH',-1,DATE '{END_DATE}')) N_IN_BREACH_BEFORE_CUTOFF,
+ COUNT_IF(OUT_DECLINE_PCT>25 AND WINDOW_AVAILABLE_DATE<DATEADD('MONTH',-1,DATE '{END_DATE}')) N_OUT_BREACH_BEFORE_CUTOFF
+FROM RATIOS GROUP BY 1 ORDER BY 1
+'''
+print('\n=== ROLLING 24M COVERAGE AND RAW DECLINES ===', flush=True)
+print(engine.query_to_df(q).to_string(index=False), flush=True)
+print('FINISHED | READ ONLY | Source screening, no portfolio, target or exposure filters applied.', flush=True)

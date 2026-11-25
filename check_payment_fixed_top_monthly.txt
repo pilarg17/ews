@@ -1,0 +1,47 @@
+# Run in the Corporate validation notebook. Read-only bank queries.
+import re
+import os
+import pandas as pd
+import numpy as np
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+from IPython.display import display, FileLink
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION = 'DEV_AA_TEAMS'
+project = dataiku.api_client().get_project(PROJECT)
+exe = SQLExecutor2(connection=CONNECTION)
+PORTS = ['GLOBAL','LARGE_CORPORATE','MID_CORPORATE','ADC','IP','OTHER_CORPORATE']
+
+def ident(value):
+    value = str(value).replace('${projectKey}', PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*', value):
+        raise ValueError('Invalid physical identifier')
+    return '"'+value+'"'
+
+def physical(name):
+    p = project.get_dataset(name).get_settings().get_raw()['params']
+    if p.get('connection') != CONNECTION:
+        raise RuntimeError('Unexpected connection: '+name)
+    return ident(p['schema'])+'.'+ident(p['table'])
+
+def query(sql):
+    x=exe.query_to_df(sql)
+    x.columns=x.columns.str.upper()
+    return x
+
+# Part 1: validate the new monthly source and payment result grid.
+M=physical('payment_fixed_top_monthly_Corporate')
+monthly=query('''SELECT TO_DATE(PAYMENT_MONTH) PAYMENT_MONTH, COUNT(*) N_ROWS,
+ COUNT_IF(IS_SOURCE_RECONCILED=1) N_RECONCILED,
+ COUNT_IF(COALESCE(IS_SOURCE_RECONCILED,0)<>1) N_EXCLUDED,
+ COUNT_IF(IS_SOURCE_RECONCILED=1 AND (TOP10_EUR<0 OR TOP10_EUR>TOP20_EUR OR TOP20_EUR>TOP30_EUR OR TOP30_EUR>FIXED_INCOMING_EUR+0.01)) N_INVALID_TOP
+ FROM '''+M+' GROUP BY 1 ORDER BY 1')
+monthly['RECONCILIATION_PCT']=100*monthly.N_RECONCILED/monthly.N_ROWS
+print('FIXED TOP MONTHLY QA')
+print(monthly.to_string(index=False))
+if len(monthly)!=25 or monthly.N_RECONCILED.eq(0).any() or monthly.N_INVALID_TOP.fillna(0).gt(0).any():
+    raise RuntimeError('Monthly fixed top source QA failed')
+print('Overall reconciliation (%)',round(100*monthly.N_RECONCILED.sum()/monthly.N_ROWS.sum(),2))
+
+print('MONTHLY SOURCE QA COMPLETE; review reconciliation before launching the backtest.')

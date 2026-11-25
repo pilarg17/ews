@@ -1,0 +1,181 @@
+# Run in the Corporate validation notebook. Read-only bank queries.
+import re
+import os
+import pandas as pd
+import numpy as np
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+from IPython.display import display, FileLink
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION = 'DEV_AA_TEAMS'
+project = dataiku.api_client().get_project(PROJECT)
+exe = SQLExecutor2(connection=CONNECTION)
+PORTS = ['GLOBAL','LARGE_CORPORATE','MID_CORPORATE','ADC','IP','OTHER_CORPORATE']
+
+def ident(value):
+    value = str(value).replace('${projectKey}', PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*', value):
+        raise ValueError('Invalid physical identifier')
+    return '"'+value+'"'
+
+def physical(name):
+    p = project.get_dataset(name).get_settings().get_raw()['params']
+    if p.get('connection') != CONNECTION:
+        raise RuntimeError('Unexpected connection: '+name)
+    return ident(p['schema'])+'.'+ident(p['table'])
+
+def query(sql):
+    x=exe.query_to_df(sql)
+    x.columns=x.columns.str.upper()
+    return x
+
+# Part 1: validate the new monthly source and payment result grid.
+M=physical('payment_fixed_top_monthly_Corporate')
+monthly=query('''SELECT TO_DATE(PAYMENT_MONTH) PAYMENT_MONTH, COUNT(*) N_ROWS,
+ COUNT_IF(IS_SOURCE_RECONCILED=1) N_RECONCILED,
+ COUNT_IF(COALESCE(IS_SOURCE_RECONCILED,0)<>1) N_EXCLUDED,
+ COUNT_IF(IS_SOURCE_RECONCILED=1 AND (TOP10_EUR<0 OR TOP10_EUR>TOP20_EUR OR TOP20_EUR>TOP30_EUR OR TOP30_EUR>FIXED_INCOMING_EUR+0.01)) N_INVALID_TOP
+ FROM '''+M+' GROUP BY 1 ORDER BY 1')
+monthly['RECONCILIATION_PCT']=100*monthly.N_RECONCILED/monthly.N_ROWS
+print('FIXED TOP MONTHLY QA')
+print(monthly.to_string(index=False))
+if len(monthly)!=25 or monthly.N_RECONCILED.eq(0).any() or monthly.N_INVALID_TOP.fillna(0).gt(0).any():
+    raise RuntimeError('Monthly fixed top source QA failed')
+print('Overall reconciliation (%)',round(100*monthly.N_RECONCILED.sum()/monthly.N_ROWS.sum(),2))
+P=physical('results_Corporate_Payments')
+pay=query('SELECT * FROM '+P)
+fixed_names={f'payment_top{n}_{r}' for n in (10,20,30) for r in ('prev3_mean','prev12_mean','prev12_max')}
+fixed=pay[pay.INDICATOR.isin(fixed_names)].copy()
+print('PAYMENTS RESULT QA')
+print(pay.groupby('PORTFOLIO').agg(ROWS=('INDICATOR','size'),INDICATORS=('INDICATOR','nunique')).to_string())
+print('FIXED TOP CONFIGURATIONS',len(fixed))
+keys=['PORTFOLIO','INDICATOR','THRESHOLD_A','THRESHOLD_B','THRESHOLD_C','TARGET_SCOPE']
+if len(pay)!=828 or pay.INDICATOR.nunique()!=46 or set(pay.PORTFOLIO)!=set(PORTS) or not pay.groupby('PORTFOLIO').size().eq(138).all() or len(fixed)!=162 or pay.duplicated(keys).any():
+    raise RuntimeError('Expected integrated Payments result grid not present; run compute_results_Corporate_Payments first')
+expected={(p,i,t) for p in PORTS for i in fixed_names for t in (20,30,50)}
+if set(zip(fixed.PORTFOLIO,fixed.INDICATOR,fixed.THRESHOLD_A))!=expected:
+    raise RuntimeError('Fixed top grid mismatch')
+if (pay.N_TP+pay.N_FN!=pay.N_EVENTS).any():
+    raise RuntimeError('Payment TP/FN QA failed')
+# The original payment-only recipe reconciles the 378 legacy configurations to the baseline.
+legacy_names={f'{i}_{r}' for i in ['payment_turnover']+[f'payment_top{n}_{z}' for n in (10,20,30) for z in ('floor','ceil')] for r in ('prev3_mean','prev12_mean','prev12_max')}
+V=physical('results_Corporate_EWS_validation')
+metrics=['N_EVENTS','N_TP','N_FP','N_ALERTS','ACCURACY','COVERAGE']
+legacy=query('SELECT '+','.join(keys+metrics)+' FROM '+V+" WHERE INDICATOR IN ("+','.join("'"+n+"'" for n in sorted(legacy_names))+")")
+check=pay.loc[pay.INDICATOR.isin(legacy_names),keys+metrics].merge(legacy,on=keys,how='outer',suffixes=('_new','_old'),indicator=True,validate='one_to_one')
+bad=check['_merge'].ne('both')
+for c in metrics:
+    a=pd.to_numeric(check[c+'_new'],errors='coerce'); b=pd.to_numeric(check[c+'_old'],errors='coerce')
+    bad |= ~(a.eq(b)|(a.isna()&b.isna()))
+print('LEGACY RECONCILIATION | rows',len(check),'| differences',int(bad.sum()))
+if len(check)!=378 or bad.any(): raise RuntimeError('Legacy payment reconciliation failed')
+print('GLOBAL FIXED TOP RESULTS')
+print(fixed.loc[fixed.PORTFOLIO.eq('GLOBAL'),['INDICATOR','THRESHOLD_A','N_EVENTS','N_TP','N_FP','N_ALERTS','ACCURACY','COVERAGE']].sort_values(['INDICATOR','THRESHOLD_A']).to_string(index=False))
+print('PAYMENTS QA PASSED | review excluded monthly observations before business signoff')
+
+# Part 2: export current results only. No Flow or source dataset changes.
+# Keep all remaining baseline combinations; replace only the dedicated families.
+sources=[
+ ('DPD','results_Corporate_DPD',30408),
+ ('Rating, PD and legacy combinations','results_Corporate_EWS_validation',302352),
+ ('Payments','results_Corporate_Payments',828),
+ ('Forbearance / probation','results_Corporate_Forbearance',120),
+ ('Limit utilisation','results_Corporate_Limit_Utilisation',246),
+ ('LTV','results_Corporate_LTV',84),
+ ('GEC contagion','results_Corporate_GEC_Contagion',114),
+ ('Recurring incoming payments','results_Corporate_Recurring_Payments',12),
+]
+cols=['PORTFOLIO','INDICATOR','TARGET_SCOPE','THRESHOLD_A','THRESHOLD_B','THRESHOLD_C','THRESHOLD_GEC_EXPOSURE','THRESHOLD_ARREARS','N_ENTITIES','N_EVENTS','N_TP','N_FP','N_FN','N_ALERTS','N_TP_ALERTS','N_EVALUATED_EPISODES','ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION','AVG_DAILY_ALERTS','MAX_DAILY_ALERTS','MAX_MONTHLY_ALERTS','TOTAL_COST','RESULT_STATUS','DATA_FREQUENCY','STATUS_DETAILS']
+text_cols={'PORTFOLIO','INDICATOR','TARGET_SCOPE','RESULT_STATUS','DATA_FREQUENCY','STATUS_DETAILS'}
+key_cols=['PORTFOLIO','INDICATOR','TARGET_SCOPE','THRESHOLD_A','THRESHOLD_B','THRESHOLD_C','THRESHOLD_GEC_EXPOSURE','THRESHOLD_ARREARS']
+notes={
+ 'DPD':'Dedicated DPD backtest. Retain source target definitions and thresholds.',
+ 'Rating, PD and legacy combinations':'Existing validation. Legacy cross-combinations retained; not all have been revalidated under current rules.',
+ 'Payments':'Monthly. Fixed Top N uses reconciled entity-months; review excluded source observations.',
+ 'Forbearance / probation':'Primary excluding-forbearance target and secondary PD100 target retained separately.',
+ 'Limit utilisation':'Monthly observations; daily outstanding methodology pending.',
+ 'LTV':'Provisional collateral coverage; ADC policy mapping provisional, IPRE policy mapping pending.',
+ 'GEC contagion':'Slotting group-head mapping provisional; no evaluated Slotting alerts in Corporate scope.',
+ 'Recurring incoming payments':'Payer identification and internal transfer/disbursement reconciliation pending.',
+}
+frames=[]
+for family,name,expected_rows in sources:
+    table=physical(name)
+    available=set(query('SELECT * FROM '+table+' WHERE 1=0').columns)
+    if not {'PORTFOLIO','INDICATOR','N_EVENTS','N_TP','N_FP'}.issubset(available):
+        raise RuntimeError('Missing essential result fields: '+name)
+    expr=[]
+    for c in cols:
+        if c in available:
+            expr.append(ident(c))
+        else:
+            expr.append(('NULL::VARCHAR' if c in text_cols else 'NULL::DOUBLE')+' AS '+ident(c))
+    where='1=1'
+    if name=='results_Corporate_EWS_validation':
+        where="""LOWER(TRIM(INDICATOR::VARCHAR)) NOT IN ('dpd','dpd x gec_exposure','dpd_arrears','dpd_gec_arrears')
+        AND INDICATOR NOT ILIKE 'payment%' AND INDICATOR NOT ILIKE 'forbearance%'
+        AND UPPER(COALESCE(TARGET_SCOPE::VARCHAR,'RATING')) NOT IN ('DPD_EARLY','DPD_LATE')"""
+    x=query('SELECT '+','.join(expr)+' FROM '+table+' WHERE '+where)
+    if len(x)!=expected_rows or set(x.PORTFOLIO)!=set(PORTS):
+        raise RuntimeError(f'{name}: expected {expected_rows} rows and six portfolios, got {len(x)}. Inspect source before exporting.')
+    x['INDICATOR']=x.INDICATOR.astype(str).str.replace('limit_weighted_monthly_proxy_','limit_weighted_monthly_',regex=False)
+    if x.duplicated(key_cols).any(): raise RuntimeError('Duplicate configurations within '+name)
+    x.insert(0,'FAMILY',family)
+    x['SOURCE_DATASET']=name
+    x['REVIEW_NOTE']=notes[family]
+    frames.append(x)
+    print('EXPORT SOURCE |',name,'|',len(x))
+results=pd.concat(frames,ignore_index=True)
+# Different source/target conventions must not be silently collapsed.
+dup=results.duplicated(key_cols,keep=False)
+if dup.any():
+    print(results.loc[dup,['SOURCE_DATASET']+key_cols].head(30).to_string(index=False))
+    raise RuntimeError('Overlapping configurations across result sources; reconcile before sending')
+results['PORTFOLIO']=pd.Categorical(results.PORTFOLIO,categories=PORTS,ordered=True)
+results=results.sort_values(['PORTFOLIO','FAMILY','INDICATOR','TARGET_SCOPE','THRESHOLD_A','THRESHOLD_B','THRESHOLD_C'],kind='stable')
+# Catalogue is an inventory of actual indicator/configuration coverage, not invented formulas.
+cat=(results.groupby(['FAMILY','INDICATOR','SOURCE_DATASET','REVIEW_NOTE'],dropna=False,observed=True)
+     .agg(N_CONFIGURATIONS=('INDICATOR','size'),N_PORTFOLIOS=('PORTFOLIO','nunique'))
+     .reset_index())
+threshold_cols=['THRESHOLD_A','THRESHOLD_B','THRESHOLD_C','THRESHOLD_GEC_EXPOSURE','THRESHOLD_ARREARS']
+for c in threshold_cols:
+    grids=results.groupby(['FAMILY','INDICATOR','SOURCE_DATASET'],dropna=False,observed=True)[c].agg(lambda z:', '.join(map(lambda v:f'{v:g}',sorted(set(pd.to_numeric(z,errors='coerce').dropna())))))
+    cat=cat.merge(grids.rename(c).reset_index(),on=['FAMILY','INDICATOR','SOURCE_DATASET'],how='left',validate='one_to_one')
+cat['TARGET_SCOPES']=cat.merge(results.groupby(['FAMILY','INDICATOR','SOURCE_DATASET'],observed=True,dropna=False).TARGET_SCOPE.agg(lambda z:', '.join(sorted(set(z.dropna().astype(str))))).rename('TARGET_SCOPES').reset_index(),on=['FAMILY','INDICATOR','SOURCE_DATASET'],how='left',validate='one_to_one').TARGET_SCOPES
+pending=pd.DataFrame([
+ ('Covenant breaches','Not backtested; incomplete/manual source. Technical implementation only.'),
+ ('Account movements rolling 12M vs previous 12M','Methodology / T24 reconciliation pending; existing payment movement results included.'),
+ ('Limit utilisation daily','Daily outstanding methodology pending; monthly results included.'),
+ ('Systematic rating downgrades','Revised methodology / comparable results pending.'),
+ ('IPRE LTV policy','Policy subtype mapping pending; available LTV results included.'),
+],columns=['PENDING_ITEM','STATUS'])
+# Preserve source metrics and nulls; do not mix legacy TOTAL_COST_CF1 with TOTAL_COST.
+import xlsxwriter
+path=os.path.abspath('Corporate_EWS_Results.xlsx')
+with xlsxwriter.Workbook(path,{'constant_memory':True,'strings_to_formulas':False,'strings_to_urls':False}) as wb:
+    header=wb.add_format({'bold':True,'bg_color':'#183B56','font_color':'#FFFFFF','text_wrap':True,'valign':'vcenter'})
+    pct=wb.add_format({'num_format':'0.00%'})
+    integer=wb.add_format({'num_format':'#,##0'})
+    decimal=wb.add_format({'num_format':'#,##0.00'})
+    def sheet(name,frame):
+        ws=wb.add_worksheet(name); ws.freeze_panes(1,2); ws.set_row(0,30)
+        ws.write_row(0,0,list(frame.columns),header)
+        ws.autofilter(0,0,len(frame),len(frame.columns)-1)
+        for j,c in enumerate(frame.columns):
+            width=60 if c in ('INDICATOR','REVIEW_NOTE','STATUS_DETAILS','STATUS') else 34 if c in ('SOURCE_DATASET','FAMILY','RESULT_STATUS','PENDING_ITEM') else 20
+            ws.set_column(j,j,width)
+        percent={'ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION'}
+        for i,row in enumerate(frame.itertuples(index=False,name=None),1):
+            for j,v in enumerate(row):
+                if pd.isna(v): continue
+                c=frame.columns[j]
+                if isinstance(v,(int,float,np.integer,np.floating)):
+                    if np.isfinite(v): ws.write_number(i,j,float(v),pct if c in percent else integer if c.startswith('N_') else decimal)
+                else: ws.write_string(i,j,str(v))
+    sheet('Results',results)
+    sheet('Indicator Catalogue',cat)
+    sheet('Open Items',pending)
+print('EXPORT COMPLETE |',len(results),'configurations |',results.INDICATOR.nunique(),'distinct indicator names')
+print(path)
+display(FileLink(os.path.basename(path)))

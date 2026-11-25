@@ -1,0 +1,303 @@
+# -*- coding: utf-8 -*-
+
+import re,time,threading
+import pandas as pd
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION='DEV_AA_TEAMS'
+START='2024-11-07'
+END='2026-10-29'
+OUTPUT='results_Corporate_GEC_Contagion'
+FAMILY='GEC_CONTAGION'
+T0=time.monotonic()
+def log(m):print('[%6.1fs] %s'%(time.monotonic()-T0,m),flush=True)
+def qi(x):
+ x=str(x).replace('${projectKey}',PROJECT)
+ if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*',x):raise RuntimeError('Invalid table identifier')
+ return '"'+x+'"'
+project=dataiku.api_client().get_project(PROJECT)
+known={d['name'] for d in project.list_datasets()}
+def physical(name,required=(),conn=CONNECTION):
+ if name not in known:raise RuntimeError('Missing dataset '+name)
+ ss=project.get_dataset(name).get_settings().get_raw()
+ prm=ss.get('params') or {}
+ if prm.get('connection')!=conn:raise RuntimeError('Connection mismatch: '+name)
+ if required:
+  cols={str(c['name']).upper() for c in dataiku.Dataset(name,project_key=PROJECT).read_schema()}
+  if set(required)-cols:raise RuntimeError('Missing columns '+name+': '+str(sorted(set(required)-cols)))
+ return qi(prm['schema'])+'.'+qi(prm['table'])
+T=physical('EWS_training_Corporate',('ENTITY_ID','MAP_DTE','TGT_ANY_SAMEDAY','GEC_HEAD_ID','GEC_MAPPING_STATUS','CLIENT_DOWNGRADE_BEST_3M','CLIENT_DOWNGRADE_BEST_6M','CLIENT_DOWNGRADE_BEST_12M','ACA_FINAL_RATING_WORST','ACA_SLOT_GRADE_CONFLICT'))
+B=physical('EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02',('ENTITY_ID','MAP_DTE','LOAN_COUNT','NOMINAL_KNOWN_LOANS','NOMINAL_KNOWN_SUM','LOAN_SOURCE_DUPLICATES','HAS_VALID_ENTITY_HISTORY'))
+L=physical('vars_loan_level',('ENTITY_ID','MAP_DTE','INSTRUMENT_ID','CONTRACT_INTERNAL_PURPOSE_CODE'))
+E=physical('vars_entity_level_merged',('ENTITY_ID','MAP_DTE','CORPORATE_SEGMENT'))
+H=physical('vars_entity_level',('ENTITY_ID','TEK_STRT_DTE','TEK_END_DTE','CORPORATE_SEGMENT'))
+G=physical('GEC_links_B01_daily',('ENTITY_ID','MAP_DTE','GEC_ID'))
+ADC=(set(range(401,408))|set(range(412,418))|set(range(422,428))|
+ set(range(432,438))|set(range(442,448))|{499,961,962,963,964,965,970})
+IP=(set(range(452,458))|set(range(462,468))|set(range(472,478))|{966,967,968,971})
+KNOWN={11,12,14,15,16,17,21,41,42,43,44,45,46,47,101,111,112,113,114,
+115,116,117,118,119,120,121,123,126,127,128,130,140,201,211,
+214,215,216,301,311,321,331,341,351,361,362,401,402,403,404,
+405,406,407,412,413,414,415,416,417,422,423,424,425,426,427,
+432,433,434,435,436,437,442,443,444,445,446,447,452,453,454,
+455,456,457,462,463,464,465,466,467,472,473,474,475,476,477,
+481,482,483,484,485,499,501,502,503,504,555,602,603,900,901,
+902,903,904,920,921,922,923,924,925,926,930,931,932,940,941,
+960,961,962,963,964,965,966,967,968,969,970,971,980,981,982,991}
+OTHER=KNOWN-ADC-IP-{555}
+nums=lambda z:','.join(map(str,sorted(z)))
+params=dict(T=T,B=B,L=L,E=E,H=H,start=START,end=END,
+  adc=nums(ADC),ip=nums(IP),other=nums(OTHER),G=G)
+
+SQL = r"""
+WITH LINK_RAW AS (
+ SELECT TO_DATE(MAP_DTE) MAP_DTE,TRIM(TO_VARCHAR(ENTITY_ID)) MEMBER_ID,
+        MIN(TRIM(TO_VARCHAR(GEC_ID))) GEC_ID,
+        COUNT(DISTINCT TRIM(TO_VARCHAR(GEC_ID))) N_GROUPS
+ FROM {G} WHERE ENTITY_ID IS NOT NULL AND GEC_ID IS NOT NULL
+ GROUP BY 1,2
+),
+LINK_OK AS (SELECT MAP_DTE,MEMBER_ID,GEC_ID FROM LINK_RAW WHERE N_GROUPS=1),
+LINK_COUNTS AS (SELECT MAP_DTE,GEC_ID,COUNT(DISTINCT MEMBER_ID) N_LINKED FROM LINK_OK GROUP BY 1,2),
+GROUP_HEAD AS (
+ SELECT l.MAP_DTE,l.GEC_ID,
+        MIN(TRIM(TO_VARCHAR(t.GEC_HEAD_ID))) HEAD_ID,
+        COUNT(DISTINCT TRIM(TO_VARCHAR(t.GEC_HEAD_ID))) N_HEADS,
+        COUNT_IF(t.GEC_HEAD_ID IS NULL) N_MISSING_HEAD
+ FROM LINK_OK l JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))
+     AND l.MAP_DTE=TO_DATE(t.MAP_DTE)
+ JOIN LINK_COUNTS c ON c.GEC_ID=l.GEC_ID AND c.MAP_DTE=l.MAP_DTE
+ GROUP BY 1,2
+ HAVING N_HEADS=1 AND N_MISSING_HEAD=0
+   AND COUNT(DISTINCT l.MEMBER_ID)=MAX(c.N_LINKED)
+),
+HEAD_VERIFIED AS (
+ SELECT g.MAP_DTE,g.GEC_ID,g.HEAD_ID
+ FROM GROUP_HEAD g
+ JOIN {T} ht ON TRIM(TO_VARCHAR(ht.ENTITY_ID))=g.HEAD_ID
+    AND TO_DATE(ht.MAP_DTE)=g.MAP_DTE
+ WHERE g.HEAD_ID IS NOT NULL
+ GROUP BY 1,2,3
+ HAVING COUNT(DISTINCT TRIM(TO_VARCHAR(ht.ENTITY_ID)))=1
+),
+-- The worst observed project grade is already aggregated at entity-day level.
+-- Multiple project grades are not an exclusion: use the worst grade if 1-4.
+-- A worst grade of 5 remains excluded, as the non-default project grades
+-- cannot be reconstructed from this aggregated input. Never impute grade 4.
+-- Keep duplicate entity-day protection separate from project-grade dispersion.
+SLOT_SOURCE_RAW AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) MEMBER_ID,TO_DATE(MAP_DTE) MAP_DTE,
+        COUNT(*) N_ROWS,
+        MAX(TRY_TO_DOUBLE(TO_VARCHAR(ACA_FINAL_RATING_WORST))) WORST_GRADE,
+        MAX(IFF(TRY_TO_BOOLEAN(TO_VARCHAR(ACA_SLOT_GRADE_CONFLICT))=FALSE,1,0)) NO_CONFLICT,
+        MAX(IFF(TRY_TO_BOOLEAN(TO_VARCHAR(ACA_SLOT_GRADE_CONFLICT))=TRUE,1,0)) GRADE_CONFLICT
+ FROM {T} WHERE ACA_FINAL_RATING_WORST IS NOT NULL
+   AND ENTITY_ID IS NOT NULL AND MAP_DTE IS NOT NULL
+   AND TO_DATE(MAP_DTE)<=DATE '{end}'
+ GROUP BY 1,2
+),
+SLOT_SOURCE AS (
+ SELECT MEMBER_ID,MAP_DTE,
+        CASE WHEN N_ROWS=1 AND WORST_GRADE IN (1,2,3,4) THEN WORST_GRADE END GRADE,
+        CASE WHEN N_ROWS=1 AND NO_CONFLICT=1 AND WORST_GRADE IN (1,2,3,4)
+             THEN WORST_GRADE END PREVIOUS_ELIGIBLE_GRADE,
+        WORST_GRADE,GRADE_CONFLICT,N_ROWS
+ FROM SLOT_SOURCE_RAW
+),
+SLOT_HISTORY AS (
+ SELECT s.*,
+        MAX(IFF(GRADE=1,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_1,
+        MAX(IFF(GRADE=2,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_2,
+        MAX(IFF(GRADE=3,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_3,
+        MAX(IFF(GRADE=4,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_4
+ FROM SLOT_SOURCE s
+),
+SLOT_FEATURES AS (
+ SELECT MEMBER_ID,MAP_DTE,
+        CASE WHEN GRADE IS NOT NULL THEN GRADE-LEAST(GRADE,COALESCE(CASE WHEN LAST_GRADE_1>=DATEADD('MONTH',-3,MAP_DTE) THEN 1 WHEN LAST_GRADE_2>=DATEADD('MONTH',-3,MAP_DTE) THEN 2 WHEN LAST_GRADE_3>=DATEADD('MONTH',-3,MAP_DTE) THEN 3 WHEN LAST_GRADE_4>=DATEADD('MONTH',-3,MAP_DTE) THEN 4 END, NULL)) END SLOT_F3,
+        CASE WHEN GRADE IS NOT NULL THEN GRADE-LEAST(GRADE,COALESCE(CASE WHEN LAST_GRADE_1>=DATEADD('MONTH',-6,MAP_DTE) THEN 1 WHEN LAST_GRADE_2>=DATEADD('MONTH',-6,MAP_DTE) THEN 2 WHEN LAST_GRADE_3>=DATEADD('MONTH',-6,MAP_DTE) THEN 3 WHEN LAST_GRADE_4>=DATEADD('MONTH',-6,MAP_DTE) THEN 4 END, NULL)) END SLOT_F6,
+        CASE WHEN GRADE IS NOT NULL THEN GRADE-LEAST(GRADE,COALESCE(CASE WHEN LAST_GRADE_1>=DATEADD('MONTH',-12,MAP_DTE) THEN 1 WHEN LAST_GRADE_2>=DATEADD('MONTH',-12,MAP_DTE) THEN 2 WHEN LAST_GRADE_3>=DATEADD('MONTH',-12,MAP_DTE) THEN 3 WHEN LAST_GRADE_4>=DATEADD('MONTH',-12,MAP_DTE) THEN 4 END, NULL)) END SLOT_F12
+ FROM SLOT_HISTORY
+),
+-- Slotting-only mapping: missing unrelated members do not invalidate a group.
+-- Require a single nonblank Head ID across all available member records.
+-- Never infer Head ID from GEC_ID or resolve conflicting Head evidence.
+SLOT_GROUP_KEYS AS (
+ SELECT DISTINCT l.MAP_DTE,l.GEC_ID FROM LINK_OK l
+ JOIN (SELECT DISTINCT MEMBER_ID FROM SLOT_SOURCE WHERE GRADE IS NOT NULL) s ON s.MEMBER_ID=l.MEMBER_ID
+),
+SLOT_GROUP_HEAD AS (
+ SELECT l.MAP_DTE,l.GEC_ID,
+        MIN(NULLIF(TRIM(TO_VARCHAR(t.GEC_HEAD_ID)),'')) HEAD_ID
+ FROM SLOT_GROUP_KEYS k JOIN LINK_OK l ON l.MAP_DTE=k.MAP_DTE AND l.GEC_ID=k.GEC_ID
+ JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID)) AND l.MAP_DTE=TO_DATE(t.MAP_DTE)
+ GROUP BY 1,2
+ HAVING COUNT(DISTINCT NULLIF(TRIM(TO_VARCHAR(t.GEC_HEAD_ID)),''))=1
+),
+SLOT_HEAD_PRESENT AS (
+ SELECT g.MAP_DTE,g.GEC_ID,g.HEAD_ID
+ FROM SLOT_GROUP_HEAD g JOIN {T} ht ON TRIM(TO_VARCHAR(ht.ENTITY_ID))=g.HEAD_ID
+ AND TO_DATE(ht.MAP_DTE)=g.MAP_DTE
+ GROUP BY 1,2,3
+ HAVING COUNT(*)=1
+),
+SLOT_MEMBER_RAW AS (
+ SELECT h.MAP_DTE,h.HEAD_ID,l.MEMBER_ID,
+        MAX(sf.SLOT_F3) SLOT_F3,MAX(sf.SLOT_F6) SLOT_F6,MAX(sf.SLOT_F12) SLOT_F12
+ FROM SLOT_HEAD_PRESENT h JOIN LINK_OK l ON h.GEC_ID=l.GEC_ID AND h.MAP_DTE=l.MAP_DTE
+ JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID)) AND h.MAP_DTE=TO_DATE(t.MAP_DTE)
+ JOIN (SELECT DISTINCT MEMBER_ID FROM SLOT_SOURCE WHERE GRADE IS NOT NULL) cohort ON cohort.MEMBER_ID=l.MEMBER_ID
+ LEFT JOIN SLOT_FEATURES sf ON sf.MEMBER_ID=l.MEMBER_ID AND sf.MAP_DTE=h.MAP_DTE
+ LEFT JOIN LINK_RAW hl ON hl.MEMBER_ID=h.HEAD_ID AND hl.MAP_DTE=h.MAP_DTE
+ WHERE h.HEAD_ID<>l.MEMBER_ID AND h.MAP_DTE BETWEEN DATE '{start}' AND DATE '{end}'
+ AND (hl.MEMBER_ID IS NULL OR (hl.N_GROUPS=1 AND hl.GEC_ID=h.GEC_ID))
+ GROUP BY 1,2,3 HAVING COUNT(*)=1
+),
+MEMBER_RAW AS (
+ SELECT h.MAP_DTE,h.HEAD_ID,l.MEMBER_ID,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_3M::VARCHAR) F3,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_6M::VARCHAR) F6,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_12M::VARCHAR) F12,
+        sf.SLOT_F3,sf.SLOT_F6,sf.SLOT_F12
+ FROM HEAD_VERIFIED h JOIN LINK_OK l ON h.GEC_ID=l.GEC_ID AND h.MAP_DTE=l.MAP_DTE
+ JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))
+    AND h.MAP_DTE=TO_DATE(t.MAP_DTE)
+ LEFT JOIN SLOT_FEATURES sf ON sf.MEMBER_ID=l.MEMBER_ID AND sf.MAP_DTE=h.MAP_DTE
+ WHERE h.HEAD_ID<>l.MEMBER_ID
+),
+MEMBER_FEATURES AS (
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,
+        'gec_member_rating_downgrade_best_3m' INDICATOR,F3 FEATURE FROM MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,
+        'gec_member_rating_downgrade_best_6m',F6 FROM MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,
+        'gec_member_rating_downgrade_best_12m',F12 FROM MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,'gec_member_slotting_downgrade_best_3m',SLOT_F3 FROM SLOT_MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,'gec_member_slotting_downgrade_best_6m',SLOT_F6 FROM SLOT_MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,'gec_member_slotting_downgrade_best_12m',SLOT_F12 FROM SLOT_MEMBER_RAW
+),
+MEMBER_PREV AS (
+ SELECT m.*,
+   LAG(MAP_DTE) OVER(PARTITION BY HEAD_ID,MEMBER_ID,INDICATOR ORDER BY MAP_DTE) PREV_DATE,
+   LAG(FEATURE) OVER(PARTITION BY HEAD_ID,MEMBER_ID,INDICATOR ORDER BY MAP_DTE) PREV_FEATURE
+ FROM MEMBER_FEATURES m
+),
+GRID_RULES AS (
+ SELECT COLUMN1::VARCHAR INDICATOR,COLUMN2::DOUBLE THRESHOLD_A,
+        0::DOUBLE THRESHOLD_B FROM VALUES
+ ('gec_member_rating_downgrade_best_3m',2),('gec_member_rating_downgrade_best_3m',3),('gec_member_rating_downgrade_best_3m',4),
+ ('gec_member_rating_downgrade_best_6m',2),('gec_member_rating_downgrade_best_6m',3),('gec_member_rating_downgrade_best_6m',4),
+ ('gec_member_rating_downgrade_best_12m',2),('gec_member_rating_downgrade_best_12m',3),('gec_member_rating_downgrade_best_12m',4),
+ ('gec_member_rating_downgrade_best_12m',5),
+ ('gec_member_slotting_downgrade_best_3m',1),
+ ('gec_member_slotting_downgrade_best_3m',2),
+ ('gec_member_slotting_downgrade_best_3m',3),
+ ('gec_member_slotting_downgrade_best_6m',1),
+ ('gec_member_slotting_downgrade_best_6m',2),
+ ('gec_member_slotting_downgrade_best_6m',3),
+ ('gec_member_slotting_downgrade_best_12m',1),
+ ('gec_member_slotting_downgrade_best_12m',2),
+ ('gec_member_slotting_downgrade_best_12m',3)
+)
+, SLOT_CROSS AS (
+ SELECT DISTINCT m.HEAD_ID,m.MEMBER_ID,m.MAP_DTE,m.INDICATOR,g.THRESHOLD_A
+ FROM MEMBER_PREV m JOIN GRID_RULES g ON g.INDICATOR=m.INDICATOR
+ WHERE m.INDICATOR LIKE 'gec_member_slotting_%' AND m.FEATURE>=g.THRESHOLD_A
+ AND m.PREV_FEATURE<g.THRESHOLD_A AND DATEDIFF('DAY',m.PREV_DATE,m.MAP_DTE) BETWEEN 1 AND 7
+)
+SELECT HEAD_ID, MAP_DTE, COUNT(DISTINCT MEMBER_ID) N_MEMBERS
+FROM SLOT_CROSS WHERE THRESHOLD_A=1 AND INDICATOR='gec_member_slotting_downgrade_best_12m'
+GROUP BY 1,2 ORDER BY 2,1
+""".format(**params)
+
+print('START | BANK SOURCE GEC HEAD QA | READ ONLY',flush=True)
+sf=SQLExecutor2(connection=CONNECTION)
+ora=SQLExecutor2(connection='PRD_BDWH')
+d=sf.query_to_df(SQL)
+d.columns=d.columns.str.upper()
+d['HEAD_ID']=d.HEAD_ID.astype(str).str.strip()
+d['DAY']=pd.to_datetime(d.MAP_DTE).dt.strftime('%Y-%m-%d')
+d=d[['HEAD_ID','DAY','N_MEMBERS']].drop_duplicates()
+print('HEADS:',d.HEAD_ID.nunique(),'HEAD-DAYS:',len(d),flush=True)
+if d.empty: raise RuntimeError('No threshold-1 crossings found')
+if (d.HEAD_ID=='').any(): raise RuntimeError('Blank head identifiers')
+if d.HEAD_ID.nunique()!=14 or len(d)!=16:
+    print('WARNING | Current crossings differ from the previous QA',flush=True)
+# Anonymous identifiers in printed output; actual identifiers used only for internal queries.
+labels={v:i+1 for i,v in enumerate(sorted(d.HEAD_ID.unique()))}
+def lit(v): return "'"+str(v).replace("'","''")+"'"
+keys=' UNION ALL '.join('SELECT '+lit(r.HEAD_ID)+" HEAD_ID, DATE '"+r.DAY+"' D FROM DUAL" for r in d.itertuples())
+days=sorted(d.DAY.unique())
+# Exact historical dates only; never substitute a later snapshot.
+def date_filter(alias):
+    return '('+' OR '.join(f"({alias}.MAP_DTE>=DATE '{day}' AND {alias}.MAP_DTE<DATE '{day}'+1)" for day in days)+')'
+meta=ora.query_to_df("""
+SELECT OWNER,TABLE_NAME,COLUMN_NAME,DATA_TYPE FROM ALL_TAB_COLUMNS
+WHERE OWNER IN ('BDL_CREDIT_INSIGHT_PLY','BDL_LOANS_PLY','BDL_RISK_CPTY_PLY')
+AND (TABLE_NAME LIKE '%DAY_VW' OR TABLE_NAME='ENTITY_DAY_VW')
+AND COLUMN_NAME IN ('MAP_DTE','ENTITY_ID','COUNTERPARTY_ID','BORROWER_ID','BORROWER_ENTITY_ID','DEBTOR_ID','DEBTOR_ENTITY_ID','INSTRUMENT_ID','CONTRACT_ID','COUNTERPARTY_SUBTYPE','INTERNAL_SEGMENT','INTERNAL_RATING','INTERNAL_RATING_DATE','HEAD_GEC_PARENT_ID','OUTSTANDING_NOMINAL_AMOUNT','COUNTERPARTY_ROLE','COUNTERPARTY_ROLE_CODE','ROLE_CODE')
+""")
+meta.columns=meta.columns.str.upper()
+cols={(o,t):set(x.COLUMN_NAME) for (o,t),x in meta.groupby(['OWNER','TABLE_NAME'])}
+ekey=('BDL_CREDIT_INSIGHT_PLY','ENTITY_DAY_VW')
+if not {'ENTITY_ID','MAP_DTE','COUNTERPARTY_SUBTYPE','INTERNAL_SEGMENT'}.issubset(cols.get(ekey,set())):
+    raise RuntimeError('Required bank entity columns not visible')
+optional=['INTERNAL_RATING','INTERNAL_RATING_DATE','HEAD_GEC_PARENT_ID']
+fields=['COUNTERPARTY_SUBTYPE','INTERNAL_SEGMENT']+[c for c in optional if c in cols[ekey]]
+expr=', '.join('MAX(TO_CHAR(e.'+c+')) '+c+', COUNT(DISTINCT TO_CHAR(e.'+c+')) N_'+c for c in fields)
+# Check bank snapshot presence separately: no row is not proof of absence if snapshot missing.
+entity_sql=f"""WITH KEYS AS ({keys}), E AS (
+ SELECT e.* FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_DAY_VW e
+ WHERE {date_filter('e')} AND TRIM(TO_CHAR(e.ENTITY_ID)) IN ({','.join(lit(v) for v in labels)})
+) SELECT k.HEAD_ID,TO_CHAR(k.D,'YYYY-MM-DD') DAY,COUNT(e.ENTITY_ID) N_ENTITY_ROWS,{expr}
+ FROM KEYS k LEFT JOIN E e ON TRIM(TO_CHAR(e.ENTITY_ID))=k.HEAD_ID AND e.MAP_DTE>=k.D AND e.MAP_DTE<k.D+1
+ GROUP BY k.HEAD_ID,k.D ORDER BY k.D,k.HEAD_ID"""
+e=ora.query_to_df(entity_sql); e.columns=e.columns.str.upper()
+e['HEAD_NO']=e.HEAD_ID.astype(str).str.strip().map(labels)
+print('\n=== BANK ENTITY SOURCE | EXACT SIGNAL DATE ===')
+# Do not print actual identifiers or head parent identifiers.
+print(e.drop(columns=['HEAD_ID','HEAD_GEC_PARENT_ID'],errors='ignore').to_string(index=False),flush=True)
+print('\n=== BANK ENTITY SNAPSHOT AVAILABILITY ===')
+q=f"SELECT TO_CHAR(TRUNC(e.MAP_DTE),'YYYY-MM-DD') DAY, COUNT(*) N_ROWS FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_DAY_VW e WHERE {date_filter('e')} GROUP BY TRUNC(e.MAP_DTE) ORDER BY 1"
+print(ora.query_to_df(q).to_string(index=False),flush=True)
+# Discover direct bank instrument/borrower relations. A generic entity or counterparty ID
+# does not prove borrower status: report links separately, never call them confirmed loans.
+ids=['BORROWER_ENTITY_ID','BORROWER_ID','DEBTOR_ENTITY_ID','DEBTOR_ID','ENTITY_ID','COUNTERPARTY_ID']
+candidates=[]
+for (owner,table),c in cols.items():
+    if not {'MAP_DTE','INSTRUMENT_ID'}.issubset(c): continue
+    for ident in ids:
+        if ident in c: candidates.append((owner,table,ident))
+print('\n=== AVAILABLE BANK INSTRUMENT-ENTITY RELATIONS ===')
+print(pd.DataFrame(candidates,columns=['OWNER','TABLE_NAME','LINK_COLUMN']).to_string(index=False),flush=True)
+# Prefer explicit borrower/debtor fields in the instrument view; generic links are evidence only.
+# Do not silently assume an unverified relationship table is the source of vars_loan_level.
+primary=[x for x in candidates if x[:2]==('BDL_CREDIT_INSIGHT_PLY','INSTRUMENT_DAY_VW')]
+if not primary:
+    primary=[x for x in candidates if x[2] in ids[:4]]
+if not primary:
+    print('NO VERIFIED DIRECT BORROWER KEY | Need source loan relationship and role mapping from candidate list.')
+else:
+    owner,table,ident=sorted(primary,key=lambda x:(ids.index(x[2]),x[0],x[1]))[0]
+    print('\n=== BANK INSTRUMENT LINKS | '+owner+'.'+table+' | '+ident+' ===',flush=True)
+    q=f"""WITH KEYS AS ({keys}), I AS (
+     SELECT i.MAP_DTE,i.{ident} LINK_ID,i.INSTRUMENT_ID FROM {owner}.{table} i
+     WHERE {date_filter('i')} AND TRIM(TO_CHAR(i.{ident})) IN ({','.join(lit(v) for v in labels)})
+    ) SELECT k.HEAD_ID,TO_CHAR(k.D,'YYYY-MM-DD') DAY,COUNT(i.LINK_ID) N_LINK_ROWS,
+       COUNT(DISTINCT i.INSTRUMENT_ID) N_LINKED_INSTRUMENTS
+     FROM KEYS k LEFT JOIN I i ON TRIM(TO_CHAR(i.LINK_ID))=k.HEAD_ID AND i.MAP_DTE>=k.D AND i.MAP_DTE<k.D+1
+     GROUP BY k.HEAD_ID,k.D ORDER BY k.D,k.HEAD_ID"""
+    i=ora.query_to_df(q); i.columns=i.columns.str.upper()
+    i['HEAD_NO']=i.HEAD_ID.astype(str).str.strip().map(labels)
+    print(i.drop(columns='HEAD_ID').to_string(index=False),flush=True)
+    q=f"SELECT TO_CHAR(TRUNC(i.MAP_DTE),'YYYY-MM-DD') DAY,COUNT(*) N_ROWS FROM {owner}.{table} i WHERE {date_filter('i')} GROUP BY TRUNC(i.MAP_DTE) ORDER BY 1"
+    print('\n=== BANK INSTRUMENT SOURCE SNAPSHOT AVAILABILITY ===')
+    print(ora.query_to_df(q).to_string(index=False),flush=True)
+    print('NOTE | Linked instruments are not necessarily active loans; borrower role and loan type must be confirmed.',flush=True)
+print('FINISHED | READ ONLY',flush=True)

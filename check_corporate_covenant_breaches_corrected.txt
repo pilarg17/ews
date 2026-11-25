@@ -1,0 +1,143 @@
+# Read-only historical screening of covenant breaches. Run as one notebook cell.
+import dataiku
+import pandas as pd
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+START,END='2024-11-07','2026-10-29'
+ora=SQLExecutor2(connection='PRD_BDWH')
+snow=SQLExecutor2(connection='DEV_AA_TEAMS')
+project=dataiku.api_client().get_project(PROJECT)
+def physical(name):
+    p=project.get_dataset(name).get_settings().get_raw()['params']
+    if p.get('connection')!='DEV_AA_TEAMS':
+        raise RuntimeError('Unexpected connection: '+name)
+    return '"'+p['schema']+'"."'+p['table'].replace('${projectKey}',PROJECT)+'"'
+L=physical('vars_loan_level')
+T=physical('EWS_training_Corporate')
+I='BDL_CREDIT_INSIGHT_PLY.INSTRUMENT_MON_VW'
+E='BDL_CREDIT_INSIGHT_PLY.ENTITY_MON_VW'
+# Distinguish SQL NULL from non-null placeholder strings inside Oracle.
+# Unknown sentinels are not interpreted as proof of an actual breach.
+base=f"""
+WITH SNAP AS (
+ SELECT TRUNC(MAP_DTE,'MM') M,MAX(TRUNC(MAP_DTE)) D
+ FROM {I} WHERE MAP_DTE>=DATE '{START}' AND MAP_DTE<DATE '{END}'+1
+ GROUP BY TRUNC(MAP_DTE,'MM')
+), COV_RAW AS (
+ SELECT s.M,s.D,TRIM(i.INSTRUMENT_ID) INSTRUMENT_ID,
+        i.FINANCIAL_COVENANT_STATUS FS,
+        CASE WHEN TRIM(i.BREACHED_COVENANTS) IS NULL THEN 'SQL_NULL'
+             WHEN UPPER(TRIM(i.BREACHED_COVENANTS)) IN
+             ('NAN','NULL','NONE','N/A','NA','UNKNOWN','UNDEFINED','NOT AVAILABLE','NOT APPLICABLE','-','11111111111')
+             THEN 'PLACEHOLDER'
+             ELSE 'POPULATED' END BS,
+        CASE WHEN TRIM(i.BREACHED_COVENANTS) IS NULL THEN 'SQL_NULL'
+             ELSE 'VALUE:'||SUBSTR(TRIM(i.BREACHED_COVENANTS),1,255) END RAW_VALUE
+ FROM SNAP s JOIN {I} i ON i.MAP_DTE>=s.D AND i.MAP_DTE<s.D+1
+ WHERE i.INSTRUMENT_ID IS NOT NULL
+), DEDUP AS (
+ SELECT M,D,INSTRUMENT_ID,COUNT(*) N_ROWS,
+        CASE WHEN COUNT(DISTINCT NVL(FS,-999))=1 AND MIN(FS) IN (1,2,3,4) THEN MIN(FS) END FS,
+        CASE WHEN COUNT(DISTINCT BS)=1 AND COUNT(DISTINCT RAW_VALUE)=1 THEN MIN(BS) ELSE 'CONFLICT' END BS,
+        CASE WHEN COUNT(DISTINCT RAW_VALUE)=1 THEN MIN(RAW_VALUE) ELSE 'CONFLICT' END RAW_VALUE
+ FROM COV_RAW GROUP BY M,D,INSTRUMENT_ID
+), HISTORY AS (
+ SELECT d.*,LAG(M) OVER(PARTITION BY INSTRUMENT_ID ORDER BY M) PREV_M,
+ LAG(FS) OVER(PARTITION BY INSTRUMENT_ID ORDER BY M) PREV_FS,
+ LAG(BS) OVER(PARTITION BY INSTRUMENT_ID ORDER BY M) PREV_BS
+ FROM DEDUP d
+), FLAGS AS (
+ SELECT h.*,
+ CASE WHEN FS IN (3,4) AND PREV_FS IN (1,2) AND PREV_M=ADD_MONTHS(M,-1) THEN 1 ELSE 0 END NEW_FIN,
+ CASE WHEN FS=4 AND PREV_FS IN (1,2,3) AND PREV_M=ADD_MONTHS(M,-1) THEN 1 ELSE 0 END NEW_MATERIAL,
+ CASE WHEN BS='POPULATED' AND PREV_BS IN ('SQL_NULL','PLACEHOLDER') AND PREV_M=ADD_MONTHS(M,-1) THEN 1 ELSE 0 END NEW_TEXT
+ FROM HISTORY h
+)
+"""
+print('START | COVENANT MONTHLY HISTORY | READ ONLY',flush=True)
+# Return aggregates and positive instrument-month candidates in a single query.
+q=base+"""
+SELECT 'SUMMARY' ROW_TYPE,TO_CHAR(M,'YYYY-MM') MONTH_ID,TO_CHAR(D,'YYYY-MM-DD') SNAP_DATE,
+ CAST(NULL AS VARCHAR2(255)) INSTRUMENT_ID,CAST(NULL AS VARCHAR2(300)) RAW_VALUE,
+ COUNT(*) N_INSTRUMENTS,SUM(CASE WHEN N_ROWS>1 THEN 1 ELSE 0 END) N_DUPLICATES,
+ SUM(CASE WHEN FS IN (1,2,3,4) THEN 1 ELSE 0 END) N_VALID_FIN_STATUS,
+ SUM(CASE WHEN FS=3 THEN 1 ELSE 0 END) N_STATUS_3,
+ SUM(CASE WHEN FS=4 THEN 1 ELSE 0 END) N_STATUS_4,
+ SUM(CASE WHEN BS='SQL_NULL' THEN 1 ELSE 0 END) N_SQL_NULL,
+ SUM(CASE WHEN BS='PLACEHOLDER' THEN 1 ELSE 0 END) N_PLACEHOLDER,
+ SUM(CASE WHEN BS='POPULATED' THEN 1 ELSE 0 END) N_POPULATED,
+ SUM(CASE WHEN BS='CONFLICT' THEN 1 ELSE 0 END) N_CONFLICT,
+ SUM(NEW_FIN) N_NEW_FIN,SUM(NEW_MATERIAL) N_NEW_MATERIAL,SUM(NEW_TEXT) N_NEW_TEXT
+ FROM FLAGS GROUP BY M,D
+UNION ALL
+SELECT 'CANDIDATE',TO_CHAR(M,'YYYY-MM'),TO_CHAR(D,'YYYY-MM-DD'),INSTRUMENT_ID,RAW_VALUE,
+ 1,CASE WHEN N_ROWS>1 THEN 1 ELSE 0 END,CASE WHEN FS IN (1,2,3,4) THEN 1 ELSE 0 END,
+ CASE WHEN FS=3 THEN 1 ELSE 0 END,CASE WHEN FS=4 THEN 1 ELSE 0 END,
+ CASE WHEN BS='SQL_NULL' THEN 1 ELSE 0 END,CASE WHEN BS='PLACEHOLDER' THEN 1 ELSE 0 END,
+ CASE WHEN BS='POPULATED' THEN 1 ELSE 0 END,CASE WHEN BS='CONFLICT' THEN 1 ELSE 0 END,
+ NEW_FIN,NEW_MATERIAL,NEW_TEXT
+ FROM FLAGS WHERE FS IN (3,4) OR BS='POPULATED'
+ORDER BY 1 DESC,2,3,4
+"""
+x=ora.query_to_df(q)
+x.columns=x.columns.str.upper()
+s=x[x.ROW_TYPE=='SUMMARY'].drop(columns=['ROW_TYPE','INSTRUMENT_ID','RAW_VALUE'])
+print('\n=== ALL BANK MONTHLY COVERAGE ===\n'+s.to_string(index=False),flush=True)
+if s.empty:
+    print('WARNING | No monthly snapshots returned; absence of breaches cannot be inferred.',flush=True)
+else:
+    expected=pd.period_range(START,END,freq='M').astype(str)
+    print('MISSING MONTHS |',','.join(sorted(set(expected)-set(s.MONTH_ID.astype(str)))) or 'NONE',flush=True)
+c=x[x.ROW_TYPE=='CANDIDATE'].copy()
+print('\n=== POTENTIALLY POPULATED BREACH VALUES ===',flush=True)
+if not c.empty:
+    print(c.loc[c.N_POPULATED==1,'RAW_VALUE'].value_counts().head(30).to_string(),flush=True)
+else:
+    print('No positive candidates in available monthly snapshots.',flush=True)
+# Match candidates to the existing Corporate loan universe, without downloading the
+# historical loan table. Exact IDs, same month, latest observed loan date <= source
+# date, maximum seven-day lag. An unmatched candidate is not a Corporate alert.
+if not c.empty:
+    def literal(v): return "'"+str(v).replace("'","''")+"'"
+    c['INSTRUMENT_ID']=c.INSTRUMENT_ID.astype(str).str.strip()
+    c['SNAP_DATE']=c.SNAP_DATE.astype(str).str[:10]
+    matches=[]
+    keys=c[['INSTRUMENT_ID','SNAP_DATE']].drop_duplicates().reset_index(drop=True)
+    for k in range(0,len(keys),500):
+        values=','.join('('+literal(r.INSTRUMENT_ID)+','+literal(r.SNAP_DATE)+')' for r in keys.iloc[k:k+500].itertuples(index=False))
+        sf=f"""WITH K AS (SELECT COLUMN1::VARCHAR INSTRUMENT_ID,TO_DATE(COLUMN2) SNAP_DATE FROM VALUES {values}),
+        MATCHED AS (
+         SELECT k.INSTRUMENT_ID,k.SNAP_DATE,TRIM(TO_VARCHAR(l.ENTITY_ID)) ENTITY_ID,TO_DATE(l.MAP_DTE) LOAN_DATE
+         FROM K k JOIN {L} l ON TRIM(TO_VARCHAR(l.INSTRUMENT_ID))=k.INSTRUMENT_ID
+         AND TO_DATE(l.MAP_DTE) BETWEEN DATEADD('DAY',-7,k.SNAP_DATE) AND k.SNAP_DATE
+         AND DATE_TRUNC('MONTH',TO_DATE(l.MAP_DTE))=DATE_TRUNC('MONTH',k.SNAP_DATE)
+         JOIN {T} t ON TRIM(TO_VARCHAR(t.ENTITY_ID))=TRIM(TO_VARCHAR(l.ENTITY_ID)) AND TO_DATE(t.MAP_DTE)=TO_DATE(l.MAP_DTE)
+         QUALIFY DENSE_RANK() OVER(PARTITION BY k.INSTRUMENT_ID,k.SNAP_DATE ORDER BY TO_DATE(l.MAP_DTE) DESC)=1
+        ) SELECT INSTRUMENT_ID,TO_VARCHAR(SNAP_DATE,'YYYY-MM-DD') SNAP_DATE,MIN(ENTITY_ID) ENTITY_ID,
+        COUNT(DISTINCT ENTITY_ID) N_OWNERS FROM MATCHED GROUP BY 1,2"""
+        m=snow.query_to_df(sf)
+        if not m.empty: matches.append(m)
+    m=pd.concat(matches,ignore_index=True) if matches else pd.DataFrame(columns=['INSTRUMENT_ID','SNAP_DATE','ENTITY_ID','N_OWNERS'])
+    c=c.merge(m,on=['INSTRUMENT_ID','SNAP_DATE'],how='left',validate='one_to_one')
+    scoped=c[c.N_OWNERS==1].copy()
+    print('CANDIDATE_ROWS |',len(c),'| CORPORATE_MATCHED |',len(scoped),'| UNMATCHED_OR_AMBIGUOUS |',len(c)-len(scoped),flush=True)
+    metrics=['N_STATUS_3','N_STATUS_4','N_POPULATED','N_NEW_FIN','N_NEW_MATERIAL','N_NEW_TEXT']
+    out=[]
+    for field in metrics:
+        z=scoped[scoped[field]==1]
+        out.append({'METRIC':field,'INSTRUMENT_MONTHS':len(z),'DISTINCT_INSTRUMENTS':z.INSTRUMENT_ID.nunique(),'DISTINCT_CLIENTS':z.ENTITY_ID.nunique()})
+    print('\n=== CORPORATE GLOBAL SCREENING ===\n'+pd.DataFrame(out).to_string(index=False),flush=True)
+# UTP11 is a default trigger; separately count its raw historical values at entity level.
+print('\nSTART | UTP11 ENTITY MONTHLY VALUES',flush=True)
+utp=ora.query_to_df(f"""
+ SELECT TO_CHAR(TRUNC(MAP_DTE,'MM'),'YYYY-MM') MONTH_ID,
+ CASE WHEN TRIM(FLAG_UTP_COVENANT_BREACH) IS NULL THEN 'SQL_NULL'
+ ELSE 'VALUE:'||TRIM(FLAG_UTP_COVENANT_BREACH) END FLAG_VALUE,
+ COUNT(*) N_ROWS
+ FROM {E} WHERE MAP_DTE>=DATE '{START}' AND MAP_DTE<DATE '{END}'+1
+ GROUP BY TRUNC(MAP_DTE,'MM'),CASE WHEN TRIM(FLAG_UTP_COVENANT_BREACH) IS NULL THEN 'SQL_NULL'
+ ELSE 'VALUE:'||TRIM(FLAG_UTP_COVENANT_BREACH) END ORDER BY 1,2
+""")
+print(utp.to_string(index=False),flush=True)
+print('FINISHED | Monthly source screening only; no datasets modified. No daily backtest or lead-time claim.',flush=True)

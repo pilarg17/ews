@@ -1,0 +1,665 @@
+# -*- coding: utf-8 -*-
+
+import re,time,threading
+import pandas as pd
+import dataiku
+from dataiku import recipe
+from dataiku.core.sql import SQLExecutor2
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION='DEV_AA_TEAMS'
+START='2024-11-07'
+END='2026-10-29'
+OUTPUT='results_Corporate_GEC_Contagion'
+FAMILY='GEC_CONTAGION'
+T0=time.monotonic()
+def log(m):print('[%6.1fs] %s'%(time.monotonic()-T0,m),flush=True)
+def qi(x):
+ x=str(x).replace('${projectKey}',PROJECT)
+ if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*',x):raise RuntimeError('Invalid table identifier')
+ return '"'+x+'"'
+project=dataiku.api_client().get_project(PROJECT)
+known={d['name'] for d in project.list_datasets()}
+def physical(name,required=(),conn=CONNECTION):
+ if name not in known:raise RuntimeError('Missing dataset '+name)
+ ss=project.get_dataset(name).get_settings().get_raw()
+ prm=ss.get('params') or {}
+ if prm.get('connection')!=conn:raise RuntimeError('Connection mismatch: '+name)
+ if required:
+  cols={str(c['name']).upper() for c in dataiku.Dataset(name,project_key=PROJECT).read_schema()}
+  if set(required)-cols:raise RuntimeError('Missing columns '+name+': '+str(sorted(set(required)-cols)))
+ return qi(prm['schema'])+'.'+qi(prm['table'])
+T=physical('EWS_training_Corporate',('ENTITY_ID','MAP_DTE','TGT_ANY_SAMEDAY','GEC_HEAD_ID','GEC_MAPPING_STATUS','CLIENT_DOWNGRADE_BEST_3M','CLIENT_DOWNGRADE_BEST_6M','CLIENT_DOWNGRADE_BEST_12M','ACA_FINAL_RATING_WORST','ACA_SLOT_GRADE_CONFLICT'))
+B=physical('EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02',('ENTITY_ID','MAP_DTE','LOAN_COUNT','NOMINAL_KNOWN_LOANS','NOMINAL_KNOWN_SUM','LOAN_SOURCE_DUPLICATES','HAS_VALID_ENTITY_HISTORY'))
+L=physical('vars_loan_level',('ENTITY_ID','MAP_DTE','INSTRUMENT_ID','CONTRACT_INTERNAL_PURPOSE_CODE'))
+E=physical('vars_entity_level_merged',('ENTITY_ID','MAP_DTE','CORPORATE_SEGMENT'))
+H=physical('vars_entity_level',('ENTITY_ID','TEK_STRT_DTE','TEK_END_DTE','CORPORATE_SEGMENT'))
+G=physical('GEC_links_B01_daily',('ENTITY_ID','MAP_DTE','GEC_ID'))
+# The new managed output normally has NO columns before its first successful build.
+# Resolve its physical table from Dataiku settings only; NEVER call read_schema() on OUTPUT.
+if OUTPUT not in known: raise RuntimeError('Create and declare the results output: '+OUTPUT)
+output_settings=project.get_dataset(OUTPUT).get_settings().get_raw()
+output_params=output_settings.get('params') or {}
+if output_params.get('connection')!=CONNECTION:
+ raise RuntimeError('Output must use Snowflake connection '+CONNECTION)
+if not output_params.get('schema') or not output_params.get('table'):
+ raise RuntimeError('Output dataset needs a configured physical schema and table (not a column schema)')
+O=qi(output_params['schema'])+'.'+qi(output_params['table'])
+# A results recipe may only create its dedicated table, never alias a legacy output.
+output_cfg=project.get_dataset(OUTPUT).get_settings().get_raw().get('params') or {}
+if str(output_cfg.get('schema','')).upper()!='RRG':
+ raise RuntimeError('Results output must be stored in RRG')
+protected_names=('results_Corporate_DPD', 'results_Corporate_EWS_validation', 'results_Corporate_Payments', 'results_Corporate_Forbearance', 'results_Corporate_EWS_review', 'results_Corporate_EWS', 'ltv_monthly_Corporate', 'limit_utilisation_features_Corporate', 'EWS_training_Corporate')
+for protected_name in protected_names:
+ if protected_name not in known:continue
+ protected_cfg=project.get_dataset(protected_name).get_settings().get_raw().get('params') or {}
+ if protected_cfg.get('connection')==CONNECTION and 'schema' in protected_cfg and 'table' in protected_cfg:
+  protected_physical=qi(protected_cfg['schema'])+'.'+qi(protected_cfg['table'])
+  if protected_physical==O:
+   raise RuntimeError('Output physical table aliases protected source: '+protected_name)
+outs={str(getattr(x,'name',x)).split('.')[-1] for x in recipe.get_outputs(object_type='DATASET')}
+if outs!={OUTPUT}:raise RuntimeError('Configure exactly one output: '+OUTPUT)
+# Do not silently read from an undeclared source: keep the Flow dependency graph accurate.
+input_names={str(getattr(x,'name',x)).split('.')[-1] for x in recipe.get_inputs(object_type='DATASET')}
+expected_inputs=('EWS_training_Corporate', 'EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02', 'vars_loan_level', 'vars_entity_level_merged', 'vars_entity_level', 'GEC_links_B01_daily')
+if not set(expected_inputs).issubset(input_names):
+ raise RuntimeError('Missing declared recipe inputs: '+', '.join(sorted(set(expected_inputs)-input_names)))
+if O in (T,B,L,E,H,G):raise RuntimeError('Output aliases source')
+ADC=(set(range(401,408))|set(range(412,418))|set(range(422,428))|
+ set(range(432,438))|set(range(442,448))|{499,961,962,963,964,965,970})
+IP=(set(range(452,458))|set(range(462,468))|set(range(472,478))|{966,967,968,971})
+KNOWN={11,12,14,15,16,17,21,41,42,43,44,45,46,47,101,111,112,113,114,
+115,116,117,118,119,120,121,123,126,127,128,130,140,201,211,
+214,215,216,301,311,321,331,341,351,361,362,401,402,403,404,
+405,406,407,412,413,414,415,416,417,422,423,424,425,426,427,
+432,433,434,435,436,437,442,443,444,445,446,447,452,453,454,
+455,456,457,462,463,464,465,466,467,472,473,474,475,476,477,
+481,482,483,484,485,499,501,502,503,504,555,602,603,900,901,
+902,903,904,920,921,922,923,924,925,926,930,931,932,940,941,
+960,961,962,963,964,965,966,967,968,969,970,971,980,981,982,991}
+OTHER=KNOWN-ADC-IP-{555}
+nums=lambda z:','.join(map(str,sorted(z)))
+params=dict(T=T,B=B,L=L,E=E,H=H,start=START,end=END,
+  adc=nums(ADC),ip=nums(IP),other=nums(OTHER),G=G)
+SQL_TEMPLATE=r"""
+WITH SEG_RAW AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE,
+        COUNT(*) N_ROWS,COUNT(DISTINCT UPPER(TRIM(TO_VARCHAR(CORPORATE_SEGMENT)))) N_SEG,
+        MIN(UPPER(TRIM(TO_VARCHAR(CORPORATE_SEGMENT)))) SEGMENT
+ FROM {E} WHERE ENTITY_ID IS NOT NULL AND MAP_DTE IS NOT NULL
+ GROUP BY 1,2
+),
+SEG_EXACT AS (SELECT ENTITY_ID,MAP_DTE,SEGMENT FROM SEG_RAW WHERE N_ROWS=1 AND N_SEG=1),
+NEED_HIST AS (
+ SELECT DISTINCT TRIM(TO_VARCHAR(t.ENTITY_ID)) ENTITY_ID,TO_DATE(t.MAP_DTE) MAP_DTE
+ FROM {T} t LEFT JOIN SEG_EXACT e ON e.ENTITY_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))
+  AND e.MAP_DTE=TO_DATE(t.MAP_DTE)
+ WHERE e.ENTITY_ID IS NULL AND TO_DATE(t.MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}'
+),
+SEG_HISTORY AS (
+ SELECT n.ENTITY_ID,n.MAP_DTE,COUNT(h.ENTITY_ID) N_MATCH,
+        COUNT(DISTINCT UPPER(TRIM(TO_VARCHAR(h.CORPORATE_SEGMENT)))) N_SEG,
+        MIN(UPPER(TRIM(TO_VARCHAR(h.CORPORATE_SEGMENT)))) SEGMENT
+ FROM NEED_HIST n LEFT JOIN {H} h ON n.ENTITY_ID=TRIM(TO_VARCHAR(h.ENTITY_ID))
+  AND n.MAP_DTE BETWEEN TO_DATE(h.TEK_STRT_DTE)
+                    AND COALESCE(TO_DATE(h.TEK_END_DTE),DATE '9999-12-31')
+ GROUP BY 1,2
+),
+SEG AS (
+ SELECT ENTITY_ID,MAP_DTE,SEGMENT FROM SEG_EXACT
+ UNION ALL
+ SELECT ENTITY_ID,MAP_DTE,SEGMENT FROM SEG_HISTORY WHERE N_MATCH=1 AND N_SEG=1
+),
+ENTITY_BASE AS (
+ SELECT TRIM(TO_VARCHAR(t.ENTITY_ID)) ENTITY_ID,TO_DATE(t.MAP_DTE) MAP_DTE,
+        seg.SEGMENT,
+        TRY_TO_NUMBER(t.TGT_ANY_SAMEDAY::VARCHAR) TARGET,
+        IFF(TRY_TO_NUMBER(b.LOAN_COUNT::VARCHAR)>0 AND
+            TRY_TO_NUMBER(b.LOAN_SOURCE_DUPLICATES::VARCHAR)=0 AND
+            TRY_TO_NUMBER(b.NOMINAL_KNOWN_LOANS::VARCHAR)=TRY_TO_NUMBER(b.LOAN_COUNT::VARCHAR),
+            TRY_TO_DOUBLE(b.NOMINAL_KNOWN_SUM::VARCHAR),NULL) EVENT_NOMINAL
+ FROM {T} t JOIN {B} b ON TRIM(TO_VARCHAR(t.ENTITY_ID))=TRIM(TO_VARCHAR(b.ENTITY_ID))
+    AND TO_DATE(t.MAP_DTE)=TO_DATE(b.MAP_DTE)
+ LEFT JOIN SEG seg ON seg.ENTITY_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))
+    AND seg.MAP_DTE=TO_DATE(t.MAP_DTE)
+ WHERE TO_DATE(t.MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}'
+    AND TRY_TO_NUMBER(b.LOAN_COUNT::VARCHAR)>0
+    AND TRY_TO_NUMBER(b.HAS_VALID_ENTITY_HISTORY::VARCHAR)=1
+ QUALIFY ROW_NUMBER() OVER (PARTITION BY t.ENTITY_ID,t.MAP_DTE
+                            ORDER BY b.MAP_DTE)=1
+),
+LOAN_CLASS AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE,
+        TRIM(TO_VARCHAR(INSTRUMENT_ID)) INSTRUMENT_ID,
+        MIN(TRY_TO_NUMBER(CONTRACT_INTERNAL_PURPOSE_CODE::VARCHAR)) PURPOSE,
+        COUNT(DISTINCT TRY_TO_NUMBER(CONTRACT_INTERNAL_PURPOSE_CODE::VARCHAR)) N_PURPOSE,
+        COUNT(*) N_ROWS
+ FROM {L}
+ WHERE TO_DATE(MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}'
+ GROUP BY 1,2,3
+),
+LOAN_SEG AS (
+ SELECT ENTITY_ID,MAP_DTE,INSTRUMENT_ID,
+        CASE WHEN PURPOSE IN ({adc}) THEN 'ADC'
+             WHEN PURPOSE IN ({ip}) THEN 'IP'
+             WHEN PURPOSE IN ({other}) THEN 'OTHER_CORPORATE'
+             ELSE NULL END PORTFOLIO
+ FROM LOAN_CLASS WHERE N_PURPOSE=1 AND N_ROWS=1
+),
+SCOPE_RAW AS (
+ SELECT 'GLOBAL' PORTFOLIO,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL
+ FROM ENTITY_BASE p
+ UNION ALL
+ SELECT p.SEGMENT,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL
+ FROM ENTITY_BASE p WHERE p.SEGMENT IN ('LARGE_CORPORATE','MID_CORPORATE')
+ UNION ALL
+ SELECT ls.PORTFOLIO,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL
+ FROM ENTITY_BASE p JOIN LOAN_SEG ls ON p.ENTITY_ID=ls.ENTITY_ID AND p.MAP_DTE=ls.MAP_DTE
+ WHERE p.SEGMENT='OTHER_CORPORATE' AND ls.PORTFOLIO IS NOT NULL
+),
+SCOPE AS (
+ SELECT PORTFOLIO,ENTITY_ID,MAP_DTE,MAX(TARGET) TARGET,
+        MAX(EVENT_NOMINAL) EVENT_NOMINAL
+ FROM SCOPE_RAW GROUP BY 1,2,3
+ HAVING COUNT(DISTINCT COALESCE(TARGET,-1))=1
+    AND COUNT(DISTINCT COALESCE(EVENT_NOMINAL,-1))=1
+),
+PORTS AS (
+ SELECT COLUMN1::VARCHAR PORTFOLIO FROM VALUES
+ ('GLOBAL'),('LARGE_CORPORATE'),('MID_CORPORATE'),('ADC'),('IP'),('OTHER_CORPORATE')
+),
+EVENT_FIRST AS (
+ SELECT PORTFOLIO,ENTITY_ID,MIN(MAP_DTE) FIRST_OBS
+ FROM SCOPE GROUP BY 1,2
+),
+EVENT_ACTIVE AS (
+ SELECT p.*,LAG(MAP_DTE) OVER(PARTITION BY PORTFOLIO,ENTITY_ID ORDER BY MAP_DTE) PREV_ACTIVE
+ FROM SCOPE p WHERE TARGET=1
+),
+EVENT_GROUP AS (
+ SELECT a.*,SUM(IFF(PREV_ACTIVE IS NULL OR MAP_DTE>DATEADD('MONTH',3,PREV_ACTIVE),1,0))
+         OVER(PARTITION BY PORTFOLIO,ENTITY_ID ORDER BY MAP_DTE ROWS UNBOUNDED PRECEDING) EVENT_GRP
+ FROM EVENT_ACTIVE a
+),
+EVENT_START AS (
+ SELECT PORTFOLIO,ENTITY_ID,MIN(MAP_DTE) EVENT_DATE
+ FROM EVENT_GROUP GROUP BY 1,2,EVENT_GRP
+),
+EVENT_CANDIDATES AS (
+ SELECT ev.PORTFOLIO,ev.ENTITY_ID,ev.EVENT_DATE,
+        ev.PORTFOLIO||'|'||ev.ENTITY_ID||'|'||TO_VARCHAR(ev.EVENT_DATE) EVENT_ID,
+        p.EVENT_NOMINAL
+ FROM EVENT_START ev JOIN SCOPE p ON p.PORTFOLIO=ev.PORTFOLIO
+    AND p.ENTITY_ID=ev.ENTITY_ID AND p.MAP_DTE=ev.EVENT_DATE
+ JOIN EVENT_FIRST f ON f.PORTFOLIO=ev.PORTFOLIO AND f.ENTITY_ID=ev.ENTITY_ID
+ WHERE ev.EVENT_DATE>=DATEADD('MONTH',11,f.FIRST_OBS)
+   AND p.EVENT_NOMINAL>=50000
+),
+EVENTS AS (
+ SELECT e.* FROM EVENT_CANDIDATES e
+ WHERE EXISTS (SELECT 1 FROM SCOPE p WHERE p.PORTFOLIO=e.PORTFOLIO
+  AND p.ENTITY_ID=e.ENTITY_ID
+  AND p.MAP_DTE BETWEEN DATEADD('MONTH',-11,e.EVENT_DATE)
+                    AND DATEADD('MONTH',-1,e.EVENT_DATE)
+  AND p.TARGET=0 AND p.EVENT_NOMINAL>=50000)
+),
+
+LINK_RAW AS (
+ SELECT TO_DATE(MAP_DTE) MAP_DTE,TRIM(TO_VARCHAR(ENTITY_ID)) MEMBER_ID,
+        MIN(TRIM(TO_VARCHAR(GEC_ID))) GEC_ID,
+        COUNT(DISTINCT TRIM(TO_VARCHAR(GEC_ID))) N_GROUPS
+ FROM {G} WHERE ENTITY_ID IS NOT NULL AND GEC_ID IS NOT NULL
+ GROUP BY 1,2
+),
+LINK_OK AS (SELECT MAP_DTE,MEMBER_ID,GEC_ID FROM LINK_RAW WHERE N_GROUPS=1),
+LINK_COUNTS AS (SELECT MAP_DTE,GEC_ID,COUNT(DISTINCT MEMBER_ID) N_LINKED FROM LINK_OK GROUP BY 1,2),
+GROUP_HEAD AS (
+ SELECT l.MAP_DTE,l.GEC_ID,
+        MIN(TRIM(TO_VARCHAR(t.GEC_HEAD_ID))) HEAD_ID,
+        COUNT(DISTINCT TRIM(TO_VARCHAR(t.GEC_HEAD_ID))) N_HEADS,
+        COUNT_IF(t.GEC_HEAD_ID IS NULL) N_MISSING_HEAD
+ FROM LINK_OK l JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))
+     AND l.MAP_DTE=TO_DATE(t.MAP_DTE)
+ JOIN LINK_COUNTS c ON c.GEC_ID=l.GEC_ID AND c.MAP_DTE=l.MAP_DTE
+ GROUP BY 1,2
+ HAVING N_HEADS=1 AND N_MISSING_HEAD=0
+   AND COUNT(DISTINCT l.MEMBER_ID)=MAX(c.N_LINKED)
+),
+HEAD_VERIFIED AS (
+ SELECT g.MAP_DTE,g.GEC_ID,g.HEAD_ID
+ FROM GROUP_HEAD g
+ JOIN {T} ht ON TRIM(TO_VARCHAR(ht.ENTITY_ID))=g.HEAD_ID
+    AND TO_DATE(ht.MAP_DTE)=g.MAP_DTE
+ WHERE g.HEAD_ID IS NOT NULL
+ GROUP BY 1,2,3
+ HAVING COUNT(DISTINCT TRIM(TO_VARCHAR(ht.ENTITY_ID)))=1
+),
+-- The worst observed project grade is already aggregated at entity-day level.
+-- Multiple project grades are not an exclusion: use the worst grade if 1-4.
+-- A worst grade of 5 remains excluded, as the non-default project grades
+-- cannot be reconstructed from this aggregated input. Never impute grade 4.
+-- Keep duplicate entity-day protection separate from project-grade dispersion.
+SLOT_SOURCE_RAW AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) MEMBER_ID,TO_DATE(MAP_DTE) MAP_DTE,
+        COUNT(*) N_ROWS,
+        MAX(TRY_TO_DOUBLE(TO_VARCHAR(ACA_FINAL_RATING_WORST))) WORST_GRADE,
+        MAX(IFF(TRY_TO_BOOLEAN(TO_VARCHAR(ACA_SLOT_GRADE_CONFLICT))=FALSE,1,0)) NO_CONFLICT,
+        MAX(IFF(TRY_TO_BOOLEAN(TO_VARCHAR(ACA_SLOT_GRADE_CONFLICT))=TRUE,1,0)) GRADE_CONFLICT
+ FROM {T} WHERE ACA_FINAL_RATING_WORST IS NOT NULL
+   AND ENTITY_ID IS NOT NULL AND MAP_DTE IS NOT NULL
+   AND TO_DATE(MAP_DTE)<=DATE '{end}'
+ GROUP BY 1,2
+),
+SLOT_SOURCE AS (
+ SELECT MEMBER_ID,MAP_DTE,
+        CASE WHEN N_ROWS=1 AND WORST_GRADE IN (1,2,3,4) THEN WORST_GRADE END GRADE,
+        CASE WHEN N_ROWS=1 AND NO_CONFLICT=1 AND WORST_GRADE IN (1,2,3,4)
+             THEN WORST_GRADE END PREVIOUS_ELIGIBLE_GRADE,
+        WORST_GRADE,GRADE_CONFLICT,N_ROWS
+ FROM SLOT_SOURCE_RAW
+),
+SLOT_HISTORY AS (
+ SELECT s.*,
+        MAX(IFF(GRADE=1,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_1,
+        MAX(IFF(GRADE=2,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_2,
+        MAX(IFF(GRADE=3,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_3,
+        MAX(IFF(GRADE=4,MAP_DTE,NULL)) OVER(PARTITION BY MEMBER_ID ORDER BY MAP_DTE ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) LAST_GRADE_4
+ FROM SLOT_SOURCE s
+),
+SLOT_FEATURES AS (
+ SELECT MEMBER_ID,MAP_DTE,
+        CASE WHEN GRADE IS NOT NULL THEN GRADE-LEAST(GRADE,COALESCE(CASE WHEN LAST_GRADE_1>=DATEADD('MONTH',-3,MAP_DTE) THEN 1 WHEN LAST_GRADE_2>=DATEADD('MONTH',-3,MAP_DTE) THEN 2 WHEN LAST_GRADE_3>=DATEADD('MONTH',-3,MAP_DTE) THEN 3 WHEN LAST_GRADE_4>=DATEADD('MONTH',-3,MAP_DTE) THEN 4 END, NULL)) END SLOT_F3,
+        CASE WHEN GRADE IS NOT NULL THEN GRADE-LEAST(GRADE,COALESCE(CASE WHEN LAST_GRADE_1>=DATEADD('MONTH',-6,MAP_DTE) THEN 1 WHEN LAST_GRADE_2>=DATEADD('MONTH',-6,MAP_DTE) THEN 2 WHEN LAST_GRADE_3>=DATEADD('MONTH',-6,MAP_DTE) THEN 3 WHEN LAST_GRADE_4>=DATEADD('MONTH',-6,MAP_DTE) THEN 4 END, NULL)) END SLOT_F6,
+        CASE WHEN GRADE IS NOT NULL THEN GRADE-LEAST(GRADE,COALESCE(CASE WHEN LAST_GRADE_1>=DATEADD('MONTH',-12,MAP_DTE) THEN 1 WHEN LAST_GRADE_2>=DATEADD('MONTH',-12,MAP_DTE) THEN 2 WHEN LAST_GRADE_3>=DATEADD('MONTH',-12,MAP_DTE) THEN 3 WHEN LAST_GRADE_4>=DATEADD('MONTH',-12,MAP_DTE) THEN 4 END, NULL)) END SLOT_F12
+ FROM SLOT_HISTORY
+),
+-- Slotting-only mapping: missing unrelated members do not invalidate a group.
+-- Require a single nonblank Head ID across all available member records.
+-- Never infer Head ID from GEC_ID or resolve conflicting Head evidence.
+SLOT_GROUP_KEYS AS (
+ SELECT DISTINCT l.MAP_DTE,l.GEC_ID FROM LINK_OK l
+ JOIN (SELECT DISTINCT MEMBER_ID FROM SLOT_SOURCE WHERE GRADE IS NOT NULL) s ON s.MEMBER_ID=l.MEMBER_ID
+),
+SLOT_GROUP_HEAD AS (
+ SELECT l.MAP_DTE,l.GEC_ID,
+        MIN(NULLIF(TRIM(TO_VARCHAR(t.GEC_HEAD_ID)),'')) HEAD_ID
+ FROM SLOT_GROUP_KEYS k JOIN LINK_OK l ON l.MAP_DTE=k.MAP_DTE AND l.GEC_ID=k.GEC_ID
+ JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID)) AND l.MAP_DTE=TO_DATE(t.MAP_DTE)
+ GROUP BY 1,2
+ HAVING COUNT(DISTINCT NULLIF(TRIM(TO_VARCHAR(t.GEC_HEAD_ID)),''))=1
+),
+SLOT_HEAD_PRESENT AS (
+ SELECT g.MAP_DTE,g.GEC_ID,g.HEAD_ID
+ FROM SLOT_GROUP_HEAD g JOIN {T} ht ON TRIM(TO_VARCHAR(ht.ENTITY_ID))=g.HEAD_ID
+ AND TO_DATE(ht.MAP_DTE)=g.MAP_DTE
+ GROUP BY 1,2,3
+ HAVING COUNT(*)=1
+),
+SLOT_MEMBER_RAW AS (
+ SELECT h.MAP_DTE,h.HEAD_ID,l.MEMBER_ID,
+        MAX(sf.SLOT_F3) SLOT_F3,MAX(sf.SLOT_F6) SLOT_F6,MAX(sf.SLOT_F12) SLOT_F12
+ FROM SLOT_HEAD_PRESENT h JOIN LINK_OK l ON h.GEC_ID=l.GEC_ID AND h.MAP_DTE=l.MAP_DTE
+ JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID)) AND h.MAP_DTE=TO_DATE(t.MAP_DTE)
+ JOIN (SELECT DISTINCT MEMBER_ID FROM SLOT_SOURCE WHERE GRADE IS NOT NULL) cohort ON cohort.MEMBER_ID=l.MEMBER_ID
+ LEFT JOIN SLOT_FEATURES sf ON sf.MEMBER_ID=l.MEMBER_ID AND sf.MAP_DTE=h.MAP_DTE
+ LEFT JOIN LINK_RAW hl ON hl.MEMBER_ID=h.HEAD_ID AND hl.MAP_DTE=h.MAP_DTE
+ WHERE h.HEAD_ID<>l.MEMBER_ID AND h.MAP_DTE BETWEEN DATE '{start}' AND DATE '{end}'
+ AND (hl.MEMBER_ID IS NULL OR (hl.N_GROUPS=1 AND hl.GEC_ID=h.GEC_ID))
+ GROUP BY 1,2,3 HAVING COUNT(*)=1
+),
+MEMBER_RAW AS (
+ SELECT h.MAP_DTE,h.HEAD_ID,l.MEMBER_ID,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_3M::VARCHAR) F3,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_6M::VARCHAR) F6,
+        TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_12M::VARCHAR) F12,
+        sf.SLOT_F3,sf.SLOT_F6,sf.SLOT_F12
+ FROM HEAD_VERIFIED h JOIN LINK_OK l ON h.GEC_ID=l.GEC_ID AND h.MAP_DTE=l.MAP_DTE
+ JOIN {T} t ON l.MEMBER_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))
+    AND h.MAP_DTE=TO_DATE(t.MAP_DTE)
+ LEFT JOIN SLOT_FEATURES sf ON sf.MEMBER_ID=l.MEMBER_ID AND sf.MAP_DTE=h.MAP_DTE
+ WHERE h.HEAD_ID<>l.MEMBER_ID
+),
+MEMBER_FEATURES AS (
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,
+        'gec_member_rating_downgrade_best_3m' INDICATOR,F3 FEATURE FROM MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,
+        'gec_member_rating_downgrade_best_6m',F6 FROM MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,
+        'gec_member_rating_downgrade_best_12m',F12 FROM MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,'gec_member_slotting_downgrade_best_3m',SLOT_F3 FROM SLOT_MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,'gec_member_slotting_downgrade_best_6m',SLOT_F6 FROM SLOT_MEMBER_RAW
+ UNION ALL
+ SELECT MAP_DTE,HEAD_ID,MEMBER_ID,'gec_member_slotting_downgrade_best_12m',SLOT_F12 FROM SLOT_MEMBER_RAW
+),
+MEMBER_PREV AS (
+ SELECT m.*,
+   LAG(MAP_DTE) OVER(PARTITION BY HEAD_ID,MEMBER_ID,INDICATOR ORDER BY MAP_DTE) PREV_DATE,
+   LAG(FEATURE) OVER(PARTITION BY HEAD_ID,MEMBER_ID,INDICATOR ORDER BY MAP_DTE) PREV_FEATURE
+ FROM MEMBER_FEATURES m
+),
+GRID_RULES AS (
+ SELECT COLUMN1::VARCHAR INDICATOR,COLUMN2::DOUBLE THRESHOLD_A,
+        0::DOUBLE THRESHOLD_B FROM VALUES
+ ('gec_member_rating_downgrade_best_3m',2),('gec_member_rating_downgrade_best_3m',3),('gec_member_rating_downgrade_best_3m',4),
+ ('gec_member_rating_downgrade_best_6m',2),('gec_member_rating_downgrade_best_6m',3),('gec_member_rating_downgrade_best_6m',4),
+ ('gec_member_rating_downgrade_best_12m',2),('gec_member_rating_downgrade_best_12m',3),('gec_member_rating_downgrade_best_12m',4),
+ ('gec_member_rating_downgrade_best_12m',5),
+ ('gec_member_slotting_downgrade_best_3m',1),
+ ('gec_member_slotting_downgrade_best_3m',2),
+ ('gec_member_slotting_downgrade_best_3m',3),
+ ('gec_member_slotting_downgrade_best_6m',1),
+ ('gec_member_slotting_downgrade_best_6m',2),
+ ('gec_member_slotting_downgrade_best_6m',3),
+ ('gec_member_slotting_downgrade_best_12m',1),
+ ('gec_member_slotting_downgrade_best_12m',2),
+ ('gec_member_slotting_downgrade_best_12m',3)
+),
+RAW_SIGNALS AS (
+ SELECT DISTINCT p.PORTFOLIO,m.HEAD_ID ENTITY_ID,m.MAP_DTE SIGNAL_DATE,
+        g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B
+ FROM MEMBER_PREV m JOIN SCOPE p ON p.ENTITY_ID=m.HEAD_ID AND p.MAP_DTE=m.MAP_DTE
+ JOIN GRID_RULES g ON m.INDICATOR=g.INDICATOR
+ WHERE m.FEATURE>=g.THRESHOLD_A AND m.PREV_FEATURE<g.THRESHOLD_A
+  AND DATEDIFF('DAY',m.PREV_DATE,m.MAP_DTE) BETWEEN 1 AND 7
+),
+SOURCE_AVAIL AS (
+ SELECT DISTINCT p.PORTFOLIO,m.HEAD_ID ENTITY_ID,m.MAP_DTE SIGNAL_DATE,g.INDICATOR
+ FROM MEMBER_FEATURES m JOIN SCOPE p ON p.ENTITY_ID=m.HEAD_ID AND p.MAP_DTE=m.MAP_DTE
+ CROSS JOIN (SELECT DISTINCT INDICATOR FROM GRID_RULES WHERE INDICATOR LIKE 'gec_member_rating_%') g
+ WHERE m.FEATURE IS NOT NULL AND m.INDICATOR LIKE 'gec_member_rating_%'
+ UNION
+ SELECT DISTINCT p.PORTFOLIO,m.HEAD_ID,m.MAP_DTE,m.INDICATOR
+ FROM MEMBER_PREV m JOIN SCOPE p ON p.ENTITY_ID=m.HEAD_ID AND p.MAP_DTE=m.MAP_DTE
+ WHERE m.INDICATOR LIKE 'gec_member_slotting_%' AND m.FEATURE IS NOT NULL AND m.PREV_FEATURE IS NOT NULL
+   AND DATEDIFF('DAY',m.PREV_DATE,m.MAP_DTE) BETWEEN 1 AND 7
+),
+
+RAW_QA AS (
+ SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,
+        COUNT(*) N_RAW_EPISODES,COUNT(DISTINCT ENTITY_ID) N_RAW_ENTITIES
+ FROM RAW_SIGNALS GROUP BY 1,2,3,4
+),
+SIGNAL_VALID AS (
+ SELECT DISTINCT s.PORTFOLIO,s.ENTITY_ID,s.SIGNAL_DATE,
+        s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B
+ FROM RAW_SIGNALS s JOIN SCOPE p ON s.PORTFOLIO=p.PORTFOLIO
+   AND s.ENTITY_ID=p.ENTITY_ID AND s.SIGNAL_DATE=p.MAP_DTE
+ WHERE p.TARGET=0 AND p.EVENT_NOMINAL>=50000
+   AND s.SIGNAL_DATE<=DATEADD('MONTH',-1,DATE '{end}')
+),
+SIGNAL_PREVIOUS AS (
+ SELECT s.*,LAG(SIGNAL_DATE) OVER(PARTITION BY PORTFOLIO,ENTITY_ID,INDICATOR,
+        THRESHOLD_A,THRESHOLD_B ORDER BY SIGNAL_DATE) PREV_START
+ FROM SIGNAL_VALID s
+),
+SIGNAL_GROUPS AS (
+ SELECT s.*,SUM(IFF(PREV_START IS NULL OR SIGNAL_DATE>DATEADD('MONTH',2,PREV_START),1,0))
+      OVER(PARTITION BY PORTFOLIO,ENTITY_ID,INDICATOR,THRESHOLD_A,THRESHOLD_B
+      ORDER BY SIGNAL_DATE ROWS UNBOUNDED PRECEDING) SIGNAL_GROUP
+ FROM SIGNAL_PREVIOUS s
+),
+SIGNALS AS (
+ SELECT PORTFOLIO,ENTITY_ID,MIN(SIGNAL_DATE) SIGNAL_DATE,
+        INDICATOR,THRESHOLD_A,THRESHOLD_B
+ FROM SIGNAL_GROUPS
+ GROUP BY PORTFOLIO,ENTITY_ID,INDICATOR,THRESHOLD_A,THRESHOLD_B,SIGNAL_GROUP
+),
+MATCHES AS (
+ SELECT s.*,e.EVENT_ID,e.EVENT_DATE,e.EVENT_NOMINAL,
+        DATEDIFF('DAY',s.SIGNAL_DATE,e.EVENT_DATE)/(365.25/12.0) LEAD_MONTHS
+ FROM SIGNALS s JOIN EVENTS e ON s.PORTFOLIO=e.PORTFOLIO AND s.ENTITY_ID=e.ENTITY_ID
+ WHERE s.SIGNAL_DATE BETWEEN DATEADD('MONTH',-11,e.EVENT_DATE)
+                        AND DATEADD('MONTH',-1,e.EVENT_DATE)
+),
+TP_FIRST AS (
+ SELECT m.* FROM MATCHES m
+ QUALIFY ROW_NUMBER() OVER (PARTITION BY PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,EVENT_ID
+ ORDER BY SIGNAL_DATE)=1
+),
+TP AS (
+ SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,
+        COUNT(*) N_TP,SUM(EVENT_NOMINAL) SUM_NOMINAL_TP,
+        SUM(EVENT_NOMINAL*(0.40*(1.0-0.50*(LEAST(11,GREATEST(1,LEAD_MONTHS))-1)/10.0))) SUM_TP_COST
+ FROM TP_FIRST GROUP BY 1,2,3,4
+),
+SIGNAL_MATCHED AS (
+ SELECT DISTINCT PORTFOLIO,ENTITY_ID,SIGNAL_DATE,INDICATOR,THRESHOLD_A,THRESHOLD_B
+ FROM MATCHES
+),
+SIGNAL_CLASS AS (
+ SELECT s.PORTFOLIO,s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B,
+        COUNT(*) N_EVALUATED_EPISODES,
+        COUNT_IF(m.ENTITY_ID IS NOT NULL) N_TP_ALERTS,
+        COUNT_IF(m.ENTITY_ID IS NULL) N_FP
+ FROM SIGNALS s LEFT JOIN SIGNAL_MATCHED m
+ ON s.PORTFOLIO=m.PORTFOLIO AND s.ENTITY_ID=m.ENTITY_ID
+ AND s.SIGNAL_DATE=m.SIGNAL_DATE AND s.INDICATOR=m.INDICATOR
+ AND s.THRESHOLD_A=m.THRESHOLD_A AND s.THRESHOLD_B=m.THRESHOLD_B
+ GROUP BY 1,2,3,4
+),
+EVENT_TOTAL AS (
+ SELECT PORTFOLIO,COUNT(*) N_EVENTS,SUM(EVENT_NOMINAL) SUM_EVENT_NOMINAL
+ FROM EVENTS GROUP BY 1
+),
+EVENT_DETECTABLE AS (
+ SELECT e.PORTFOLIO,s.INDICATOR,COUNT(DISTINCT e.EVENT_ID) N_EVENTS_DETECTABLE
+ FROM EVENTS e JOIN SOURCE_AVAIL s ON e.PORTFOLIO=s.PORTFOLIO AND e.ENTITY_ID=s.ENTITY_ID
+ JOIN SCOPE ep ON ep.PORTFOLIO=s.PORTFOLIO AND ep.ENTITY_ID=s.ENTITY_ID
+   AND ep.MAP_DTE=s.SIGNAL_DATE AND ep.TARGET=0 AND ep.EVENT_NOMINAL>=50000
+ AND s.SIGNAL_DATE BETWEEN DATEADD('MONTH',-11,e.EVENT_DATE)
+                        AND DATEADD('MONTH',-1,e.EVENT_DATE)
+ GROUP BY 1,2
+),
+ALERT_DAY AS (
+ SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,SIGNAL_DATE,
+        COUNT(DISTINCT ENTITY_ID) N_DAILY_ALERTS
+ FROM SIGNALS GROUP BY 1,2,3,4,5
+),
+ALERT_MAX AS (
+ SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,
+        MAX(N_DAILY_ALERTS) MAX_DAILY_ALERTS
+ FROM ALERT_DAY GROUP BY 1,2,3,4
+),
+EVAL_DAYS AS (
+ SELECT PORTFOLIO,COUNT(DISTINCT MAP_DTE) N_EVALUATION_DAYS
+ FROM SCOPE WHERE MAP_DTE<=DATEADD('MONTH',-1,DATE '{end}') GROUP BY 1
+),
+GRID AS (
+ SELECT p.PORTFOLIO,g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B FROM PORTS p
+ CROSS JOIN GRID_RULES g
+),
+METRIC_BASE AS (
+ SELECT g.PORTFOLIO,g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B,
+        COALESCE(et.N_EVENTS,0) N_EVENTS,COALESCE(tp.N_TP,0) N_TP,
+        COALESCE(sc.N_FP,0) N_FP,COALESCE(sc.N_TP_ALERTS,0) N_TP_ALERTS,
+        COALESCE(sc.N_EVALUATED_EPISODES,0) N_EVALUATED_EPISODES,
+        COALESCE(ev.N_EVENTS_DETECTABLE,0) N_EVENTS_DETECTABLE,
+        COALESCE(q.N_RAW_EPISODES,0) N_RAW_EPISODES,
+        COALESCE(q.N_RAW_ENTITIES,0) N_RAW_ENTITIES,
+        COALESCE(d.N_EVALUATION_DAYS,0) N_EVALUATION_DAYS,
+        COALESCE(am.MAX_DAILY_ALERTS,0) MAX_DAILY_ALERTS,
+        et.SUM_EVENT_NOMINAL,tp.SUM_NOMINAL_TP,tp.SUM_TP_COST
+ FROM GRID g
+ LEFT JOIN EVENT_TOTAL et ON g.PORTFOLIO=et.PORTFOLIO
+ LEFT JOIN EVENT_DETECTABLE ev ON g.PORTFOLIO=ev.PORTFOLIO AND g.INDICATOR=ev.INDICATOR
+ LEFT JOIN TP tp ON g.PORTFOLIO=tp.PORTFOLIO AND g.INDICATOR=tp.INDICATOR
+  AND g.THRESHOLD_A=tp.THRESHOLD_A AND g.THRESHOLD_B=tp.THRESHOLD_B
+ LEFT JOIN SIGNAL_CLASS sc ON g.PORTFOLIO=sc.PORTFOLIO AND g.INDICATOR=sc.INDICATOR
+  AND g.THRESHOLD_A=sc.THRESHOLD_A AND g.THRESHOLD_B=sc.THRESHOLD_B
+ LEFT JOIN RAW_QA q ON g.PORTFOLIO=q.PORTFOLIO AND g.INDICATOR=q.INDICATOR
+  AND g.THRESHOLD_A=q.THRESHOLD_A AND g.THRESHOLD_B=q.THRESHOLD_B
+ LEFT JOIN EVAL_DAYS d ON g.PORTFOLIO=d.PORTFOLIO
+ LEFT JOIN ALERT_MAX am ON g.PORTFOLIO=am.PORTFOLIO AND g.INDICATOR=am.INDICATOR
+  AND g.THRESHOLD_A=am.THRESHOLD_A AND g.THRESHOLD_B=am.THRESHOLD_B
+)
+SELECT m.PORTFOLIO,m.INDICATOR,'FULL_EWS' TARGET_SCOPE,
+       m.THRESHOLD_A,m.THRESHOLD_B,NULL::DOUBLE THRESHOLD_C,
+       m.N_EVENTS,m.N_TP,m.N_FP,GREATEST(m.N_EVENTS-m.N_TP,0) N_FN,
+       m.N_TP+m.N_FP N_ALERTS,m.N_EVALUATED_EPISODES,m.N_TP_ALERTS,
+       IFF(m.N_TP+m.N_FP>0,ROUND(m.N_TP/(m.N_TP+m.N_FP),4),NULL) ACCURACY,
+       IFF(m.N_EVENTS>0,ROUND(m.N_TP/m.N_EVENTS,4),NULL) COVERAGE,
+       IFF(m.N_EVENTS_DETECTABLE>0,ROUND(m.N_TP/m.N_EVENTS_DETECTABLE,4),NULL) COVERAGE_2,
+       IFF(MAX(m.N_TP) OVER (PARTITION BY m.PORTFOLIO,m.INDICATOR)>0,
+           ROUND(m.N_TP/MAX(m.N_TP) OVER(PARTITION BY m.PORTFOLIO,m.INDICATOR),4),NULL) COVERAGE_3,
+       IFF(m.N_EVALUATED_EPISODES>0,ROUND(m.N_TP_ALERTS/m.N_EVALUATED_EPISODES,4),NULL) ALERT_PRECISION,
+       m.N_EVENTS_DETECTABLE,m.N_RAW_EPISODES,m.N_RAW_ENTITIES,
+       m.N_EVALUATION_DAYS,m.MAX_DAILY_ALERTS,
+       IFF(m.N_EVALUATION_DAYS>0,ROUND(m.N_EVALUATED_EPISODES/m.N_EVALUATION_DAYS,4),NULL) AVG_DAILY_ALERTS,
+       IFF(m.N_EVALUATION_DAYS>0,ROUND(m.N_RAW_EPISODES/m.N_EVALUATION_DAYS,4),NULL) AVG_DAILY_RAW_EPISODES,
+       ROUND(500*m.N_FP+COALESCE(m.SUM_TP_COST,0)+0.40*GREATEST(COALESCE(m.SUM_EVENT_NOMINAL,0)-COALESCE(m.SUM_NOMINAL_TP,0),0),2) TOTAL_COST_CF1,
+       ROUND(1000*m.N_TP+200*m.N_FP+0.5*COALESCE(m.SUM_TP_COST,0)+0.20*GREATEST(COALESCE(m.SUM_EVENT_NOMINAL,0)-COALESCE(m.SUM_NOMINAL_TP,0),0),2) TOTAL_COST,
+       'ELIGIBLE_KNOWN_EXPOSURE_ONLY' COST_CF1_STATUS,
+       IFF(m.INDICATOR LIKE 'gec_member_slotting_%','GEC_SLOT_CONSENSUS_PENDING_SIGNOFF','GEC_HEAD_MAPPING_REQUIRES_BUSINESS_SIGNOFF') RESULT_STATUS,
+       'DAILY' DATA_FREQUENCY
+FROM METRIC_BASE m ORDER BY m.PORTFOLIO,m.INDICATOR,m.THRESHOLD_A,m.THRESHOLD_B
+"""
+SQL=SQL_TEMPLATE.format(**params)
+exe=SQLExecutor2(connection=CONNECTION)
+def nonnegative_count(frame, field):
+ if frame is None or frame.empty or field not in frame.columns: return 0
+ value=frame.iloc[0][field]
+ if pd.isna(value): return 0
+ value=int(value)
+ if value<0: raise RuntimeError('Negative source counter: '+field)
+ return value
+
+log('COMPILE | '+FAMILY)
+exe.query_to_df('SELECT * FROM ('+SQL+') z WHERE 1=0')
+
+log('SOURCE CHECK | GEC member and Head mapping evidence')
+# Explicitly report each join stage so a missing Head mapping cannot be mistaken
+# for a zero-predictive-power backtest. Never assume GEC_ID == ENTITY_ID.
+source_prefix=SQL.split(',\nMEMBER_RAW AS (')[0]
+source_check=source_prefix+'''
+SELECT
+ (SELECT COUNT(*) FROM LINK_RAW) N_LINKED_MEMBER_DAYS,
+ (SELECT COUNT(*) FROM LINK_OK) N_UNAMBIGUOUS_MEMBER_DAYS,
+ (SELECT COUNT(*) FROM LINK_COUNTS) N_GROUP_DAYS,
+ (SELECT COUNT(*) FROM GROUP_HEAD) N_UNIQUE_HEAD_GROUP_DAYS,
+ (SELECT COUNT(*) FROM HEAD_VERIFIED) N_VERIFIED_HEAD_GROUP_DAYS,
+ (SELECT COUNT(*) FROM HEAD_VERIFIED h JOIN LINK_OK m
+  ON h.MAP_DTE=m.MAP_DTE AND h.GEC_ID=m.GEC_ID
+  WHERE m.MEMBER_ID<>h.HEAD_ID) N_VERIFIED_NON_HEAD_MEMBER_DAYS,
+ (SELECT COUNT(*) FROM {T} WHERE GEC_HEAD_ID IS NOT NULL) N_TRAIN_ROWS_WITH_HEAD_ID,
+ (SELECT COUNT(*) FROM {T} WHERE GEC_MAPPING_STATUS IS NOT NULL) N_TRAIN_ROWS_WITH_MAPPING_STATUS,
+ (SELECT COALESCE(COUNT_IF(m.MEMBER_ID<>h.HEAD_ID AND
+    (TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_3M::VARCHAR) IS NOT NULL OR
+     TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_6M::VARCHAR) IS NOT NULL OR
+     TRY_TO_DOUBLE(t.CLIENT_DOWNGRADE_BEST_12M::VARCHAR) IS NOT NULL)),0)
+  FROM HEAD_VERIFIED h
+  JOIN LINK_OK m ON h.MAP_DTE=m.MAP_DTE AND h.GEC_ID=m.GEC_ID
+  JOIN {T} t ON TRIM(TO_VARCHAR(t.ENTITY_ID))=m.MEMBER_ID
+   AND TO_DATE(t.MAP_DTE)=m.MAP_DTE) N_USABLE_MEMBER_DAYS,
+ (SELECT COUNT_IF(PREVIOUS_ELIGIBLE_GRADE IS NOT NULL) FROM SLOT_SOURCE) N_PREVIOUS_SLOT_DAYS,
+ (SELECT COUNT_IF(GRADE IS NOT NULL) FROM SLOT_SOURCE) N_CURRENT_SLOT_DAYS,
+ (SELECT COUNT_IF(GRADE IS NOT NULL AND PREVIOUS_ELIGIBLE_GRADE IS NULL) FROM SLOT_SOURCE) N_RECOVERED_SLOT_DAYS,
+ (SELECT COUNT_IF(N_ROWS=1 AND WORST_GRADE=5) FROM SLOT_SOURCE) N_EXCLUDED_GRADE_5_DAYS,
+ (SELECT COUNT_IF(N_ROWS=1 AND WORST_GRADE=5 AND GRADE_CONFLICT=1) FROM SLOT_SOURCE) N_GRADE_5_MIXED_DAYS
+'''.format(T=T)
+source_info=exe.query_to_df(source_check)
+print('\n=== GEC_SOURCE_VALIDATION ===\n'+source_info.to_csv(index=False,sep=';'),flush=True)
+if nonnegative_count(source_info,'N_USABLE_MEMBER_DAYS')==0:
+ raise RuntimeError(
+  'GEC mapping cannot be validated: zero usable member-Head days. '
+  'Review GEC_SOURCE_VALIDATION by stage. No output written, and no backtest '
+  'metrics are available. Do not equate group identifier to Head ENTITY_ID.')
+
+slot_prefix=SQL.split(',\nGRID_RULES AS (')[0]
+slot_info=exe.query_to_df(slot_prefix+"""
+ SELECT INDICATOR,COUNT_IF(FEATURE IS NOT NULL) N_VALID_FEATURE_DAYS,
+ COUNT(DISTINCT IFF(FEATURE IS NOT NULL,MEMBER_ID,NULL)) N_VALID_MEMBERS,
+ COUNT_IF(FEATURE IS NOT NULL AND PREV_FEATURE IS NOT NULL AND
+          DATEDIFF('DAY',PREV_DATE,MAP_DTE) BETWEEN 1 AND 7) N_COMPARABLE_DAYS,
+ COUNT(DISTINCT IFF(FEATURE IS NOT NULL AND PREV_FEATURE IS NOT NULL AND
+          DATEDIFF('DAY',PREV_DATE,MAP_DTE) BETWEEN 1 AND 7,MEMBER_ID,NULL)) N_COMPARABLE_MEMBERS,
+ COUNT_IF(FEATURE>=1 AND PREV_FEATURE<1 AND DATEDIFF('DAY',PREV_DATE,MAP_DTE) BETWEEN 1 AND 7) N_CROSSINGS_1,
+ COUNT_IF(FEATURE>=2 AND PREV_FEATURE<2 AND DATEDIFF('DAY',PREV_DATE,MAP_DTE) BETWEEN 1 AND 7) N_CROSSINGS_2,
+ COUNT_IF(FEATURE>=3 AND PREV_FEATURE<3 AND DATEDIFF('DAY',PREV_DATE,MAP_DTE) BETWEEN 1 AND 7) N_CROSSINGS_3
+ FROM MEMBER_PREV WHERE INDICATOR LIKE 'gec_member_slotting_%' GROUP BY 1 ORDER BY 1
+""")
+print('\n=== SLOTTING_SOURCE_VALIDATION ===\n'+slot_info.to_csv(index=False,sep=';'),flush=True)
+if len(slot_info)!=3 or not (slot_info.N_COMPARABLE_DAYS>0).all():
+ raise RuntimeError('No usable Slotting history for one or more windows; output not replaced')
+# Check the actual backtest scope for every raw Slotting crossing.
+# The candidate Head need not itself appear in the membership link; its ID is
+# explicitly supplied by the training group members and must exist uniquely.
+# This consensus mapping is provisional and must receive business signoff.
+attrition_prefix, n_split = re.subn(r',\s*RAW_QA AS \(.*\Z', '', SQL, count=1, flags=re.S)
+if n_split != 1:
+ raise RuntimeError('Cannot isolate GEC attrition CTE prefix')
+attrition_sql=attrition_prefix+"""
+, SLOT_CROSS AS (
+ SELECT DISTINCT m.HEAD_ID,m.MEMBER_ID,m.MAP_DTE,m.INDICATOR,g.THRESHOLD_A
+ FROM MEMBER_PREV m JOIN GRID_RULES g ON g.INDICATOR=m.INDICATOR
+ WHERE m.INDICATOR LIKE 'gec_member_slotting_%' AND m.FEATURE>=g.THRESHOLD_A
+   AND m.PREV_FEATURE<g.THRESHOLD_A AND DATEDIFF('DAY',m.PREV_DATE,m.MAP_DTE) BETWEEN 1 AND 7
+), CROSS_QA AS (
+ SELECT c.*,p.ENTITY_ID SCOPE_ID,p.TARGET,p.EVENT_NOMINAL
+ FROM SLOT_CROSS c LEFT JOIN SCOPE p ON p.PORTFOLIO='GLOBAL'
+ AND p.ENTITY_ID=c.HEAD_ID AND p.MAP_DTE=c.MAP_DTE
+)
+SELECT INDICATOR,THRESHOLD_A,COUNT(*) N_MEMBER_CROSSINGS,
+ COUNT_IF(SCOPE_ID IS NULL) N_HEAD_OUTSIDE_SCOPE,
+ COUNT_IF(SCOPE_ID IS NOT NULL AND (TARGET IS NULL OR TARGET<>0)) N_HEAD_TARGET_NOT_HEALTHY,
+ COUNT_IF(SCOPE_ID IS NOT NULL AND TARGET=0 AND (EVENT_NOMINAL IS NULL OR EVENT_NOMINAL<50000)) N_HEAD_EXPOSURE_INELIGIBLE,
+ COUNT_IF(SCOPE_ID IS NOT NULL AND TARGET=0 AND EVENT_NOMINAL>=50000 AND MAP_DTE>DATEADD('MONTH',-1,DATE '"""+END+"""')) N_RIGHT_CENSORED,
+ COUNT_IF(SCOPE_ID IS NOT NULL AND TARGET=0 AND EVENT_NOMINAL>=50000 AND MAP_DTE<=DATEADD('MONTH',-1,DATE '"""+END+"""')) N_ELIGIBLE_MEMBER_CROSSINGS
+ FROM CROSS_QA GROUP BY 1,2 ORDER BY 1,2
+"""
+print('\n=== SLOTTING_CROSSING_ATTRITION ===\n'+exe.query_to_df(attrition_sql).to_csv(index=False,sep=';'),flush=True)
+# Read the small existing results table to verify that PD metrics are preserved.
+# No historical source is rebuilt and no new dataset is needed.
+pd_cols='PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,N_EVENTS,N_TP,N_FP,N_FN,N_ALERTS,N_TP_ALERTS,N_EVALUATED_EPISODES,N_EVENTS_DETECTABLE,N_RAW_EPISODES,N_RAW_ENTITIES,MAX_DAILY_ALERTS,AVG_DAILY_ALERTS,TOTAL_COST_CF1,TOTAL_COST'
+pd_query="SELECT "+pd_cols+" FROM "+O+" WHERE INDICATOR LIKE 'gec_member_rating_%' ORDER BY 1,2,3,4"
+old_pd=exe.query_to_df(pd_query)
+if len(old_pd)!=60:
+ raise RuntimeError('Expected 60 existing PD configurations for reconciliation; output not replaced')
+candidate=exe.query_to_df(SQL)
+if len(candidate)!=114 or candidate.duplicated(['PORTFOLIO','INDICATOR','THRESHOLD_A','THRESHOLD_B']).any():
+ raise RuntimeError('Candidate grid QA failed; existing output preserved')
+if not ((candidate.N_TP+candidate.N_FN)==candidate.N_EVENTS).all() or not ((candidate.N_TP_ALERTS+candidate.N_FP)==candidate.N_EVALUATED_EPISODES).all():
+ raise RuntimeError('Candidate metric QA failed; existing output preserved')
+cols=pd_cols.split(',')
+keys=['PORTFOLIO','INDICATOR','THRESHOLD_A','THRESHOLD_B']
+try:
+ pd.testing.assert_frame_equal(old_pd[cols].sort_values(keys).reset_index(drop=True),candidate.loc[candidate.INDICATOR.str.startswith('gec_member_rating_'),cols].sort_values(keys).reset_index(drop=True),check_dtype=False,check_exact=False,rtol=1e-10,atol=1e-8)
+except AssertionError as exc:
+ raise RuntimeError('Candidate PD reconciliation failed; existing output preserved') from exc
+log('PREWRITE PD RECONCILIATION | 60 configurations unchanged')
+log('BUILD | '+FAMILY+' | only '+OUTPUT)
+# Execute query to the configured new managed Snowflake output without moving entity-day history into Python.
+executor=SQLExecutor2(connection=CONNECTION)
+done=threading.Event()
+def progress():
+ while not done.wait(20):log('RUNNING | '+FAMILY+' | computation active')
+watch=threading.Thread(target=progress,daemon=True);watch.start()
+try:
+ SQLExecutor2.exec_recipe_fragment(dataiku.Dataset(OUTPUT,project_key=PROJECT), SQL, overwrite_output_schema=True)
+finally:
+ done.set();watch.join(timeout=1)
+log('OUTPUT BUILT | '+OUTPUT)
+phys=O
+r=exe.query_to_df('SELECT PORTFOLIO,COUNT(*) N_CONFIGS,COUNT_IF(N_TP+N_FN<>N_EVENTS) BAD_TP_FN,COUNT_IF(N_TP_ALERTS+N_FP<>N_EVALUATED_EPISODES) BAD_ALERTS,MAX(N_RAW_EPISODES) MAX_RAW,MAX(N_EVENTS_DETECTABLE) MAX_DETECTABLE FROM '+phys+' GROUP BY 1 ORDER BY 1')
+print('\n=== '+FAMILY+'_QA ===\n'+r.to_csv(index=False,sep=';'),flush=True)
+expected_configs_per_portfolio=19
+if len(r)!=6 or not (r.N_CONFIGS==expected_configs_per_portfolio).all() or (r[['BAD_TP_FN','BAD_ALERTS']].fillna(0)>0).any().any():
+ raise RuntimeError('Backtest QA failed; inspect new output before using results')
+
+qa=exe.query_to_df('SELECT COUNT_IF(N_TP>N_EVENTS OR N_TP<0 OR N_FP<0 OR N_FN<0 OR N_EVALUATED_EPISODES<0 OR N_TP_ALERTS>N_EVALUATED_EPISODES) N_INVALID, COUNT_IF(ACCURACY<0 OR ACCURACY>1 OR COVERAGE<0 OR COVERAGE>1 OR COVERAGE_2<0 OR COVERAGE_2>1 OR COVERAGE_3<0 OR COVERAGE_3>1) N_RATE_INVALID FROM '+phys)
+print('\n=== BACKTEST_METRIC_QA ===\n'+qa.to_csv(index=False,sep=';'),flush=True)
+if nonnegative_count(qa, 'N_INVALID')>0 or nonnegative_count(qa, 'N_RATE_INVALID')>0:
+ raise RuntimeError('Metric consistency check failed: quarantine this output until corrected')
+
+if (r['MAX_DETECTABLE'].fillna(0)==0).all():log('WARNING | no events have a verified source lookback; do not interpret missing signals as zero predictive value')
+new_pd=exe.query_to_df(pd_query)
+try:
+ pd.testing.assert_frame_equal(old_pd.reset_index(drop=True),new_pd.reset_index(drop=True),check_dtype=False,check_exact=False,rtol=1e-10,atol=1e-8)
+except AssertionError as exc:
+ raise RuntimeError('PD reconciliation failed; do not distribute this output before review') from exc
+log('PD_RECONCILIATION | 60 existing configurations unchanged')
+slot_results=exe.query_to_df("SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,N_RAW_EPISODES,N_RAW_ENTITIES,N_EVALUATED_EPISODES,N_TP,N_FP,N_EVENTS_DETECTABLE FROM "+phys+" WHERE INDICATOR LIKE 'gec_member_slotting_%' ORDER BY 1,2,3")
+print('\n=== SLOTTING_RESULTS ===\n'+slot_results.to_csv(index=False,sep=';'),flush=True)
+log('FINISHED | '+FAMILY+' | only dedicated results output updated')

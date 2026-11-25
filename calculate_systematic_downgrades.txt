@@ -1,0 +1,306 @@
+# -*- coding: utf-8 -*-
+"""Corporate EWS | systematic rating downgrade candidate calculation.
+Notebook cell. Read-only source access; no Flow datasets or recipes changed.
+Count distinct observed rating reviews, not the latest reviewed entity per day.
+Materiality uses known nominal exposure, explicitly disclosing incomplete coverage.
+"""
+import re
+import dataiku
+import pandas as pd
+import numpy as np
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION = 'PRD_BDWH'
+SNOW = 'DEV_AA_TEAMS'
+START = '2024-11-07'
+END = '2026-10-29'
+BATCH_DAYS = 7
+PRIOR_LOOKBACK_DAYS = 30
+WINDOW_MONTHS = 6
+DOWNGRADE_THRESHOLD = 0.60
+EXPOSURE_THRESHOLD = 0.05
+NOTCH = {
+    'AAA+':1,'AAA':2,'AA+':3,'AA':4,'AA-':5,'A+':6,'A':7,'A-':8,
+    'BBB+':9,'BBB':10,'BBB-':11,'BB+':12,'BB':13,'BB-':14,'B+':15,
+    'B':16,'B-':17,'CCC':18,'D':19,
+}
+
+def to_dates(series):
+    return pd.to_datetime(series,errors='coerce',utc=True).dt.tz_localize(None).dt.normalize()
+
+def fmt(ts):
+    return pd.Timestamp(ts).strftime('%Y-%m-%d')
+
+def sql_to_df(query):
+    f=SQLExecutor2(connection=CONNECTION).query_to_df(query)
+    f.columns=f.columns.str.upper()
+    return f
+
+project=dataiku.api_client().get_project(PROJECT)
+def qi(x):
+    x=str(x).replace('${projectKey}',PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*',x):
+        raise RuntimeError('Invalid SQL identifier')
+    return '"'+x+'"'
+
+def physical(name,required):
+    cfg=project.get_dataset(name).get_settings().get_raw()['params']
+    if cfg['connection']!=SNOW: raise RuntimeError('Unexpected connection for '+name)
+    cols={c['name'].upper() for c in dataiku.Dataset(name,project_key=PROJECT).read_schema()}
+    if set(required)-cols: raise RuntimeError('Missing fields: '+name+' '+str(set(required)-cols))
+    return qi(cfg['schema'])+'.'+qi(cfg['table'])
+
+B=physical('EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02',('ENTITY_ID','MAP_DTE','LOAN_COUNT','NOMINAL_KNOWN_LOANS','NOMINAL_KNOWN_SUM','LOAN_SOURCE_DUPLICATES','HAS_VALID_ENTITY_HISTORY'))
+T=physical('EWS_training_Corporate',('ENTITY_ID','MAP_DTE'))
+E=physical('vars_entity_level_merged',('ENTITY_ID','MAP_DTE','RESIDENCE_COUNTRY','ECONOMIC_ACTIVITY'))
+H=physical('vars_entity_level',('ENTITY_ID','TEK_STRT_DTE','TEK_END_DTE','RESIDENCE_COUNTRY','ECONOMIC_ACTIVITY'))
+
+range_df=sql_to_df("""SELECT TRUNC(MIN(MAP_DTE)) MIN_DATE,TRUNC(MAX(MAP_DTE)) MAX_DATE
+ FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_DAY_VW WHERE COUNTERPARTY_SUBTYPE='LEGAL_PERSON'""")
+source_min=to_dates(range_df['MIN_DATE']).iloc[0]
+source_max=to_dates(range_df['MAX_DATE']).iloc[0]
+if pd.isna(source_min) or pd.isna(source_max): raise RuntimeError('Missing historical source dates')
+end_date=min(source_max,pd.Timestamp(END))
+start_date=max(source_min,pd.Timestamp(START)-pd.DateOffset(months=WINDOW_MONTHS))
+if end_date<start_date: raise RuntimeError('No review history in requested period')
+print('REVIEW SOURCE RANGE',source_min.date(),source_max.date(),flush=True)
+
+def fetch_batch(batch_start, batch_end_exclusive):
+    b, e = fmt(batch_start), fmt(batch_end_exclusive)
+    # Read only the six-month review cohort, not all legal entities.
+    # Select the prior rating in the same 30-day pre-review window used previously.
+    query = f"""
+    WITH current_reviews AS (
+        SELECT
+            ent.ENTITY_ID,
+            TRUNC(ent.MAP_DTE) AS AS_OF_DATE,
+            ent.RESIDENCE_COUNTRY,
+            ent.ECONOMIC_ACTIVITY,
+            ent.IRG_RATING_MODEL,
+            ent.INTERNAL_RATING,
+            ent.INTERNAL_RATING_DATE,
+            CASE
+                WHEN UPPER(TRIM(ent.INTERNAL_SEGMENT)) LIKE 'LARGE_CORP%'
+                  OR UPPER(TRIM(ent.INTERNAL_SEGMENT)) LIKE 'COLL%'
+                    THEN 'LARGE_CORPORATE'
+                WHEN UPPER(TRIM(ent.INTERNAL_SEGMENT)) LIKE 'PME%'
+                  OR UPPER(TRIM(ent.INTERNAL_SEGMENT)) LIKE 'PROJ%'
+                  OR UPPER(TRIM(ent.INTERNAL_SEGMENT)) LIKE 'SPV%'
+                  OR UPPER(TRIM(ent.INTERNAL_SEGMENT)) = 'MUL_ADC'
+                    THEN 'OTHER_CORPORATE'
+                ELSE 'MID_CORPORATE'
+            END AS CORPORATE_SEGMENT
+        FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_DAY_VW ent
+        WHERE ent.MAP_DTE >= DATE '{b}'
+          AND ent.MAP_DTE < DATE '{e}'
+          AND ent.COUNTERPARTY_SUBTYPE = 'LEGAL_PERSON'
+          AND SUBSTR(TO_CHAR(ent.ENTITY_ID), 1, 2) <> '64'
+          AND (
+              ent.INTERNAL_SEGMENT IS NULL
+              OR (
+                  UPPER(TRIM(ent.INTERNAL_SEGMENT)) NOT LIKE 'INST%'
+                  AND UPPER(TRIM(ent.INTERNAL_SEGMENT)) NOT LIKE 'BANK%'
+                  AND UPPER(TRIM(ent.INTERNAL_SEGMENT)) NOT LIKE 'SOVE%'
+                  AND UPPER(TRIM(ent.INTERNAL_SEGMENT)) NOT IN
+                      ('BMDV01_01', 'SBCR01_01', 'SPUB01_01')
+              )
+          )
+          AND ent.INTERNAL_RATING_DATE >= ADD_MONTHS(TRUNC(ent.MAP_DTE), -6)
+          AND ent.INTERNAL_RATING_DATE >= DATE '{fmt(source_min)}'
+          AND ent.INTERNAL_RATING_DATE < TRUNC(ent.MAP_DTE) + 1
+    ), previous_ratings AS (
+        SELECT
+            cur.ENTITY_ID,
+            cur.AS_OF_DATE,
+            MAX(hist.INTERNAL_RATING) KEEP (
+                DENSE_RANK LAST ORDER BY hist.MAP_DTE
+            ) AS PREVIOUS_INTERNAL_RATING,
+            MAX(hist.IRG_RATING_MODEL) KEEP (
+                DENSE_RANK LAST ORDER BY hist.MAP_DTE
+            ) AS PREVIOUS_RATING_MODEL
+        FROM current_reviews cur
+        LEFT JOIN BDL_CREDIT_INSIGHT_PLY.ENTITY_DAY_VW hist
+          ON hist.ENTITY_ID = cur.ENTITY_ID
+         AND hist.MAP_DTE < TRUNC(cur.INTERNAL_RATING_DATE)
+         AND hist.MAP_DTE >= TRUNC(cur.INTERNAL_RATING_DATE) - {PRIOR_LOOKBACK_DAYS}
+        GROUP BY cur.ENTITY_ID, cur.AS_OF_DATE
+    )
+    SELECT
+        cur.*,
+        prev.PREVIOUS_INTERNAL_RATING,
+        prev.PREVIOUS_RATING_MODEL
+    FROM current_reviews cur
+    LEFT JOIN previous_ratings prev
+      ON prev.ENTITY_ID = cur.ENTITY_ID
+     AND prev.AS_OF_DATE = cur.AS_OF_DATE
+    """
+    return sql_to_df(query)
+
+
+
+# Select the first observation of each entity / rating review date / rating model.
+# A second review on the same day in the same model is not distinguishable from
+# daily snapshots. Do not count repeated snapshots as separate review events.
+seen=set()
+parts=[]
+batch_start=start_date
+while batch_start<=end_date:
+    batch_end=min(batch_start+pd.Timedelta(days=BATCH_DAYS),end_date+pd.Timedelta(days=1))
+    df=fetch_batch(batch_start,batch_end)
+    if not df.empty:
+        df['AS_OF_DATE']=to_dates(df['AS_OF_DATE'])
+        df['INTERNAL_RATING_DATE']=to_dates(df['INTERNAL_RATING_DATE'])
+        for col in ('ENTITY_ID','IRG_RATING_MODEL','INTERNAL_RATING','PREVIOUS_INTERNAL_RATING','PREVIOUS_RATING_MODEL'):
+            df[col]=df[col].astype('string').str.strip().str.upper()
+        df=df.dropna(subset=['ENTITY_ID','AS_OF_DATE','INTERNAL_RATING_DATE'])
+        if df.duplicated(['ENTITY_ID','AS_OF_DATE']).any():
+            raise RuntimeError('Conflicting duplicate entity-day source rows; review history not safe')
+        df=df.loc[df.INTERNAL_RATING_DATE.le(df.AS_OF_DATE)].copy()
+        df['IRG_RATING_MODEL']=df['IRG_RATING_MODEL'].fillna('UNKNOWN')
+        keys=['ENTITY_ID','INTERNAL_RATING_DATE','IRG_RATING_MODEL']
+        first=df.sort_values('AS_OF_DATE').drop_duplicates(keys).copy()
+        mask=[]
+        for row in first[keys].itertuples(index=False,name=None):
+            mask.append(row not in seen)
+            seen.add(row)
+        first=first.loc[np.asarray(mask,dtype=bool)].copy()
+        notch=first.INTERNAL_RATING.map(NOTCH)-first.PREVIOUS_INTERNAL_RATING.map(NOTCH)
+        first['COMPARABLE']=(notch.notna() & first.IRG_RATING_MODEL.ne('UNKNOWN') &
+                             first.IRG_RATING_MODEL.eq(first.PREVIOUS_RATING_MODEL)).fillna(False)
+        first['DOWNGRADE']=first['COMPARABLE'] & notch.ge(1)
+        first['RESIDENCE_COUNTRY']=first.RESIDENCE_COUNTRY.astype('string').str.strip().str.upper().replace('',pd.NA).fillna('UNKNOWN')
+        first['ECONOMIC_ACTIVITY_2D']=first.ECONOMIC_ACTIVITY.astype('string').str.strip().str.extract(r'^(\d{2})',expand=False).fillna('UNKNOWN')
+        parts.append(first[['ENTITY_ID','AS_OF_DATE','INTERNAL_RATING_DATE','IRG_RATING_MODEL','RESIDENCE_COUNTRY','ECONOMIC_ACTIVITY_2D','COMPARABLE','DOWNGRADE']])
+    print('REVIEWS |',fmt(batch_start),'| distinct events so far',len(seen),flush=True)
+    batch_start=batch_end
+if not parts: raise RuntimeError('No observed rating reviews')
+review_events=pd.concat(parts,ignore_index=True)
+if review_events.empty: raise RuntimeError('No observed rating review events')
+
+# Exposure by date, based on the same Corporate entity population as the GEC
+# backtest. Include the known part of incomplete nominal amounts, without
+# treating unobserved amounts as zero or estimating unknown exposure.
+# Country of residence is a documented fallback; country-of-risk mapping is
+# not silently inferred from one of several possible loan countries.
+exposure_sql=f"""
+WITH TRAIN AS (
+ SELECT DISTINCT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE
+ FROM {T} WHERE TO_DATE(MAP_DTE) BETWEEN DATE '{START}' AND DATE '{END}'
+),
+B_UNIQUE AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE,
+        TRY_TO_NUMBER(TO_VARCHAR(LOAN_COUNT)) N_LOANS,
+        TRY_TO_NUMBER(TO_VARCHAR(NOMINAL_KNOWN_LOANS)) N_KNOWN_LOANS,
+        TRY_TO_NUMBER(TO_VARCHAR(LOAN_SOURCE_DUPLICATES)) N_DUP,
+        TRY_TO_DOUBLE(TO_VARCHAR(NOMINAL_KNOWN_SUM)) NOMINAL,
+        TRY_TO_NUMBER(TO_VARCHAR(HAS_VALID_ENTITY_HISTORY)) VALID_HISTORY
+ FROM {B} WHERE TO_DATE(MAP_DTE) BETWEEN DATE '{START}' AND DATE '{END}'
+ QUALIFY COUNT(*) OVER(PARTITION BY TRIM(TO_VARCHAR(ENTITY_ID)),TO_DATE(MAP_DTE))=1
+),
+BASE AS (
+ SELECT b.ENTITY_ID,b.MAP_DTE,b.N_LOANS,
+        IFF(N_DUP=0 AND N_KNOWN_LOANS BETWEEN 1 AND N_LOANS AND NOMINAL>=0,N_KNOWN_LOANS,0) N_KNOWN_LOANS,
+        IFF(N_DUP=0 AND N_KNOWN_LOANS BETWEEN 1 AND N_LOANS AND NOMINAL>=0,NOMINAL,NULL) KNOWN_NOMINAL
+ FROM B_UNIQUE b JOIN TRAIN t ON b.ENTITY_ID=t.ENTITY_ID AND b.MAP_DTE=t.MAP_DTE
+ WHERE b.VALID_HISTORY=1 AND b.N_LOANS>0
+),
+E_RAW AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE,
+        COUNT(*) N_ROWS,MIN(UPPER(TRIM(TO_VARCHAR(RESIDENCE_COUNTRY)))) COUNTRY,
+        MIN(REGEXP_SUBSTR(TRIM(TO_VARCHAR(ECONOMIC_ACTIVITY)),'^[0-9][0-9]')) SECTOR
+ FROM {E} WHERE TO_DATE(MAP_DTE) BETWEEN DATE '{START}' AND DATE '{END}' GROUP BY 1,2
+),
+HIST AS (
+ SELECT b.ENTITY_ID,b.MAP_DTE,COUNT(h.ENTITY_ID) N_ROWS,
+        MIN(UPPER(TRIM(TO_VARCHAR(h.RESIDENCE_COUNTRY)))) COUNTRY,
+        MIN(REGEXP_SUBSTR(TRIM(TO_VARCHAR(h.ECONOMIC_ACTIVITY)),'^[0-9][0-9]')) SECTOR
+ FROM BASE b LEFT JOIN E_RAW e ON b.ENTITY_ID=e.ENTITY_ID AND b.MAP_DTE=e.MAP_DTE
+ JOIN {H} h ON TRIM(TO_VARCHAR(h.ENTITY_ID))=b.ENTITY_ID
+ AND b.MAP_DTE BETWEEN TO_DATE(h.TEK_STRT_DTE) AND COALESCE(TO_DATE(h.TEK_END_DTE),DATE '9999-12-31')
+ WHERE e.ENTITY_ID IS NULL GROUP BY 1,2
+),
+DIMS AS (
+ SELECT b.*,
+        COALESCE(NULLIF(IFF(e.N_ROWS=1,e.COUNTRY,IFF(h.N_ROWS=1,h.COUNTRY,NULL)),''),'UNKNOWN') COUNTRY,
+        COALESCE(NULLIF(IFF(e.N_ROWS=1,e.SECTOR,IFF(h.N_ROWS=1,h.SECTOR,NULL)),''),'UNKNOWN') SECTOR
+ FROM BASE b LEFT JOIN E_RAW e ON b.ENTITY_ID=e.ENTITY_ID AND b.MAP_DTE=e.MAP_DTE
+ LEFT JOIN HIST h ON b.ENTITY_ID=h.ENTITY_ID AND b.MAP_DTE=h.MAP_DTE
+),
+GROUPED AS (
+ SELECT MAP_DTE,'RESIDENCE_COUNTRY' SOURCE_COLUMN,COUNTRY SOURCE_VALUE,
+        SUM(KNOWN_NOMINAL) GROUP_KNOWN_NOMINAL,SUM(N_LOANS) N_LOANS,
+        SUM(N_KNOWN_LOANS) N_KNOWN_LOANS,COUNT(*) N_ENTITIES
+ FROM DIMS GROUP BY 1,2,3
+ UNION ALL
+ SELECT MAP_DTE,'ECONOMIC_ACTIVITY_2D',SECTOR,SUM(KNOWN_NOMINAL),SUM(N_LOANS),SUM(N_KNOWN_LOANS),COUNT(*)
+ FROM DIMS GROUP BY 1,2,3
+)
+SELECT *,SUM(GROUP_KNOWN_NOMINAL) OVER(PARTITION BY MAP_DTE,SOURCE_COLUMN) TOTAL_KNOWN_NOMINAL,
+       SUM(N_KNOWN_LOANS) OVER(PARTITION BY MAP_DTE,SOURCE_COLUMN) PORTFOLIO_KNOWN_LOANS,
+       SUM(N_LOANS) OVER(PARTITION BY MAP_DTE,SOURCE_COLUMN) PORTFOLIO_LOANS
+FROM GROUPED
+"""
+print('EXPOSURE | calculating historical known nominal share',flush=True)
+exposure=SQLExecutor2(connection=SNOW).query_to_df(exposure_sql)
+exposure.columns=exposure.columns.str.upper()
+exposure['AS_OF_DATE']=to_dates(exposure.pop('MAP_DTE'))
+if exposure.empty or exposure.duplicated(['AS_OF_DATE','SOURCE_COLUMN','SOURCE_VALUE']).any():
+    raise RuntimeError('Invalid group exposure history')
+for c in ('GROUP_KNOWN_NOMINAL','TOTAL_KNOWN_NOMINAL','N_LOANS','N_KNOWN_LOANS','PORTFOLIO_LOANS','PORTFOLIO_KNOWN_LOANS'):
+    exposure[c]=pd.to_numeric(exposure[c],errors='coerce')
+exposure['EXPOSURE_SHARE']=exposure.GROUP_KNOWN_NOMINAL/exposure.TOTAL_KNOWN_NOMINAL.where(exposure.TOTAL_KNOWN_NOMINAL.gt(0))
+exposure['PORTFOLIO_LOAN_AMOUNT_COVERAGE']=exposure.PORTFOLIO_KNOWN_LOANS/exposure.PORTFOLIO_LOANS.where(exposure.PORTFOLIO_LOANS.gt(0))
+exposure['GROUP_LOAN_AMOUNT_COVERAGE']=exposure.N_KNOWN_LOANS/exposure.N_LOANS.where(exposure.N_LOANS.gt(0))
+
+# Count each observed review once in each rolling calendar window. Separate
+# event availability (first observed date) from the effective review date.
+# Group membership is taken from the first observed review; exposure is as-of
+# the evaluation date. Aggregate across models only after same-model comparisons.
+dates=pd.DatetimeIndex(sorted(exposure.AS_OF_DATE.dropna().unique()))
+cutoffs=dates-pd.DateOffset(months=WINDOW_MONTHS)
+full= cutoffs>=source_min
+rows=[]
+for dim in ('RESIDENCE_COUNTRY','ECONOMIC_ACTIVITY_2D'):
+    for value,g in review_events.groupby(dim,dropna=False):
+        start=dates.searchsorted(g.AS_OF_DATE.to_numpy(),side='left')
+        stop=cutoffs.searchsorted(g.INTERNAL_RATING_DATE.to_numpy(),side='right')
+        valid=start<stop
+        if not valid.any(): continue
+        a=start[valid]; b=stop[valid]
+        metrics={}
+        for name,weights in [('N_REVIEWS',np.ones(len(g),dtype=np.int64)),('N_COMPARABLE',g.COMPARABLE.to_numpy(dtype=np.int64)),('N_DOWNGRADE_1_PLUS',g.DOWNGRADE.to_numpy(dtype=np.int64))]:
+            dif=np.zeros(len(dates)+1,dtype=np.int64)
+            np.add.at(dif,a,weights[valid]); np.add.at(dif,b,-weights[valid])
+            metrics[name]=np.cumsum(dif[:-1])
+        z=pd.DataFrame({'AS_OF_DATE':dates,'SOURCE_COLUMN':dim,'SOURCE_VALUE':str(value),**metrics})
+        z['FULL_WINDOW']=full
+        rows.append(z)
+if not rows: raise RuntimeError('No comparable historical group observations')
+review_metrics=pd.concat(rows,ignore_index=True)
+systematic_group_daily=review_metrics.merge(exposure,on=['AS_OF_DATE','SOURCE_COLUMN','SOURCE_VALUE'],how='outer',validate='one_to_one')
+z=systematic_group_daily
+z['FULL_WINDOW']=(z.AS_OF_DATE-pd.DateOffset(months=WINDOW_MONTHS)).ge(source_min)
+for col in ('N_REVIEWS','N_COMPARABLE','N_DOWNGRADE_1_PLUS'):
+    z[col]=z[col].fillna(0).astype('int64')
+z['N_NOT_COMPARABLE']=z.N_REVIEWS-z.N_COMPARABLE
+if not (z.N_DOWNGRADE_1_PLUS.le(z.N_COMPARABLE)&z.N_COMPARABLE.le(z.N_REVIEWS)).all():
+    raise RuntimeError('Review counts do not reconcile')
+z['DOWNGRADE_RATIO']=z.N_DOWNGRADE_1_PLUS/z.N_COMPARABLE.where(z.N_COMPARABLE.gt(0))
+z['DOWNGRADE_RATIO_ALL']=z.N_DOWNGRADE_1_PLUS/z.N_REVIEWS.where(z.N_REVIEWS.gt(0))
+z['CANDIDATE_BREACH']=(z.FULL_WINDOW & z.SOURCE_VALUE.ne('UNKNOWN') &
+                       z.DOWNGRADE_RATIO.gt(DOWNGRADE_THRESHOLD) & z.EXPOSURE_SHARE.ge(EXPOSURE_THRESHOLD))
+z['CANDIDATE_BREACH_ALL_REVIEWS']=(z.FULL_WINDOW & z.SOURCE_VALUE.ne('UNKNOWN') &
+                       z.DOWNGRADE_RATIO_ALL.gt(DOWNGRADE_THRESHOLD) & z.EXPOSURE_SHARE.ge(EXPOSURE_THRESHOLD))
+print('\n=== DISTINCT OBSERVED REVIEW EVENTS ===')
+print('Events:',len(review_events),'Comparable:',int(review_events.COMPARABLE.sum()),'Downgrades:',int(review_events.DOWNGRADE.sum()))
+print('\n=== SYSTEMATIC GROUP SUMMARY | FULL WINDOWS ===')
+print(z.loc[z.FULL_WINDOW].groupby('SOURCE_COLUMN').agg(N_OBSERVATIONS=('SOURCE_VALUE','size'),N_CANDIDATE_BREACH=('CANDIDATE_BREACH','sum'),N_BREACH_ALL_REVIEWS=('CANDIDATE_BREACH_ALL_REVIEWS','sum')).to_string())
+latest=z.AS_OF_DATE.max()
+cols=['AS_OF_DATE','SOURCE_COLUMN','SOURCE_VALUE','N_REVIEWS','N_COMPARABLE','N_DOWNGRADE_1_PLUS','DOWNGRADE_RATIO','DOWNGRADE_RATIO_ALL','EXPOSURE_SHARE','GROUP_LOAN_AMOUNT_COVERAGE','PORTFOLIO_LOAN_AMOUNT_COVERAGE','CANDIDATE_BREACH']
+print('\n=== LATEST MATERIAL GROUPS ===')
+print(z.loc[z.AS_OF_DATE.eq(latest)&z.EXPOSURE_SHARE.ge(EXPOSURE_THRESHOLD),cols].sort_values(['SOURCE_COLUMN','EXPOSURE_SHARE'],ascending=[True,False]).to_string(index=False))
+print('\n=== HISTORICAL CANDIDATE BREACHES BY GROUP ===')
+print(z.loc[z.CANDIDATE_BREACH].groupby(['SOURCE_COLUMN','SOURCE_VALUE']).size().rename('N_BREACH_DAYS').to_string())
+print('\nFINISHED | candidate dataframe: systematic_group_daily | no datasets or recipes modified')
+print('NOTE | exposure share uses known nominal; unobserved exposure and review-event granularity need business QA.')

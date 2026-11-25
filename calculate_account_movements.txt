@@ -1,0 +1,82 @@
+# -*- coding: utf-8 -*-
+"""Corporate EWS | 12M versus preceding 12M payment-flow candidate.
+Read only. Do not write to payment signals or results until scope and availability are verified.
+"""
+import re
+import dataiku
+import pandas as pd
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+SOURCE='payment_movements_monthly_Corporate'
+CONNECTION='DEV_AA_TEAMS'
+project=dataiku.api_client().get_project(PROJECT)
+cfg=project.get_dataset(SOURCE).get_settings().get_raw()['params']
+if cfg['connection']!=CONNECTION: raise RuntimeError('Unexpected source connection')
+def qi(x):
+    x=str(x).replace('${projectKey}',PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*',x): raise RuntimeError('Invalid SQL identifier')
+    return '"'+x+'"'
+P=qi(cfg['schema'])+'.'+qi(cfg['table'])
+required={'ENTITY_ID','PAYMENT_MONTH','INCOMING_EUR','OUTGOING_EUR'}
+cols={c['name'].upper() for c in dataiku.Dataset(SOURCE,project_key=PROJECT).read_schema()}
+if required-cols: raise RuntimeError('Missing source fields: '+str(required-cols))
+ex=SQLExecutor2(connection=CONNECTION)
+qa=ex.query_to_df(f"""SELECT COUNT(*) N_ROWS,COUNT(DISTINCT DATE_TRUNC('MONTH',TO_DATE(PAYMENT_MONTH))) N_MONTHS,
+ MIN(TO_DATE(PAYMENT_MONTH)) FIRST_MONTH,MAX(TO_DATE(PAYMENT_MONTH)) LAST_MONTH,
+ COUNT_IF(TRY_TO_DOUBLE(TO_VARCHAR(INCOMING_EUR))<0) NEG_INCOMING,
+ COUNT_IF(TRY_TO_DOUBLE(TO_VARCHAR(OUTGOING_EUR))<0) NEG_OUTGOING,
+ COUNT_IF(INCOMING_EUR IS NULL) NULL_INCOMING,COUNT_IF(OUTGOING_EUR IS NULL) NULL_OUTGOING
+ FROM {P}""")
+print('=== PAYMENT SOURCE QA ===\n'+qa.to_string(index=False))
+# Flow totals must be unsigned magnitudes, as expected by the decline ratio.
+# Do not guess a sign convention if the source has negative values.
+if int(qa.NEG_INCOMING.iloc[0] or 0)>0 or int(qa.NEG_OUTGOING.iloc[0] or 0)>0:
+    raise RuntimeError('Payment sign convention requires reconciliation before calculating decline')
+q=f"""
+WITH RAW AS (
+ SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,DATE_TRUNC('MONTH',TO_DATE(PAYMENT_MONTH)) PAYMENT_MONTH,
+        TRY_TO_DOUBLE(TO_VARCHAR(INCOMING_EUR)) INCOMING_EUR,
+        TRY_TO_DOUBLE(TO_VARCHAR(OUTGOING_EUR)) OUTGOING_EUR
+ FROM {P} WHERE ENTITY_ID IS NOT NULL AND PAYMENT_MONTH IS NOT NULL
+),
+MONTHLY AS (
+ SELECT ENTITY_ID,PAYMENT_MONTH,
+        IFF(COUNT(*)=1,MIN(INCOMING_EUR),NULL) INCOMING_EUR,
+        IFF(COUNT(*)=1,MIN(OUTGOING_EUR),NULL) OUTGOING_EUR
+ FROM RAW GROUP BY 1,2
+),
+ROLL AS (
+ SELECT *,
+ MIN(PAYMENT_MONTH) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) FIRST_MONTH,
+ COUNT(*) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) N_MONTHS,
+ COUNT(INCOMING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) N_IN,
+ COUNT(OUTGOING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND CURRENT ROW) N_OUT,
+ SUM(INCOMING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) IN_CURRENT,
+ SUM(INCOMING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND 12 PRECEDING) IN_PRIOR,
+ SUM(OUTGOING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 11 PRECEDING AND CURRENT ROW) OUT_CURRENT,
+ SUM(OUTGOING_EUR) OVER(PARTITION BY ENTITY_ID ORDER BY PAYMENT_MONTH ROWS BETWEEN 23 PRECEDING AND 12 PRECEDING) OUT_PRIOR
+ FROM MONTHLY
+),
+RATIOS AS (
+ SELECT ENTITY_ID,PAYMENT_MONTH,
+ IFF(N_MONTHS=24 AND DATEDIFF('MONTH',FIRST_MONTH,PAYMENT_MONTH)=23 AND N_IN=24 AND IN_PRIOR>0,
+     (IN_PRIOR-IN_CURRENT)/NULLIF(IN_PRIOR,0),NULL) IN_DECLINE,
+ IFF(N_MONTHS=24 AND DATEDIFF('MONTH',FIRST_MONTH,PAYMENT_MONTH)=23 AND N_OUT=24 AND OUT_PRIOR>0,
+     (OUT_PRIOR-OUT_CURRENT)/NULLIF(OUT_PRIOR,0),NULL) OUT_DECLINE
+ FROM ROLL
+)
+SELECT ENTITY_ID,PAYMENT_MONTH,IN_DECLINE,OUT_DECLINE,
+       IN_DECLINE>=0.25 IN_BREACH,OUT_DECLINE>=0.25 OUT_BREACH
+FROM RATIOS WHERE IN_DECLINE IS NOT NULL OR OUT_DECLINE IS NOT NULL
+"""
+account_movement_candidates=ex.query_to_df(q)
+print('\n=== 24-MONTH OBSERVABLE PAYMENT WINDOWS ===')
+print('Rows:',len(account_movement_candidates))
+if not account_movement_candidates.empty:
+    print(account_movement_candidates.groupby('PAYMENT_MONTH').agg(
+        N_ENTITIES=('ENTITY_ID','nunique'),N_IN_COMPARABLE=('IN_DECLINE','count'),
+        N_OUT_COMPARABLE=('OUT_DECLINE','count'),N_IN_BREACH=('IN_BREACH','sum'),
+        N_OUT_BREACH=('OUT_BREACH','sum')).to_string())
+print('\nFINISHED | read only | candidate dataframe: account_movement_candidates')
+print('NOTE | No alerts/backtest yet. Confirm payment-month availability, completeness, and portfolio scope before deployment.')

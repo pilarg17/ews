@@ -1,0 +1,756 @@
+# -*- coding: utf-8 -*-
+"""Corporate EWS | historical limit utilisation reconstruction.
+
+Dataiku PYTHON RECIPE, not a notebook cell. Reads the historical loan table
+and original Oracle sources; writes TWO new technical validation datasets.
+Never writes to training, original crossing stage or production results.
+Conservatively excludes shared limits and incomplete entity-month ratios.
+"""
+import re
+import time
+import numpy as np
+import pandas as pd
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+SNOW = 'DEV_AA_TEAMS'
+ORACLE = 'PRD_BDWH'
+TRAIN_START = '2024-11-07'
+TRAIN_END = '2026-10-29'
+PREVIEW_MONTHS = None  # FULL HISTORICAL RUN; no preview
+MAX_ROWS_PER_MONTH = 60000
+MAX_BATCH_KEYS = 450                 # safely below Oracle IN(1000) limit
+MAX_RFO_LOOKBACK_DAYS = 62           # never consider a future RFO version
+MAX_LIMIT_STALENESS_DAYS = 35         # source snapshot not later than loan snapshot
+REG_KNOWN_QA_SAMPLE = 100            # optional known-loan reconciliation per month
+REG_NO_MATCH_DIAGNOSTIC_KEYS = 30     # bounded source QA only; no silent version fallback
+THRESHOLDS_PCT_DIAGNOSTIC = (70, 80, 90, 95, 100)
+T0 = time.monotonic()
+
+def log(message):
+    print('[%7.1fs] %s' % (time.monotonic()-T0, message), flush=True)
+
+def show(title, x, cap=80):
+    print('\n' + title, flush=True)
+    if isinstance(x, (list, tuple, dict)):
+        x = pd.DataFrame([x] if isinstance(x, dict) else x)
+    print('NO ROWS' if x is None or x.empty else
+          x.head(cap).to_csv(index=False, sep=';', na_rep='NULL'), flush=True)
+
+def norm(v):
+    if v is None or pd.isna(v):
+        return None
+    s = str(v).strip()
+    if not s or s.lower() in ('nan', 'none', 'null'):
+        return None
+    return re.sub(r'\.0+$', '', s) if re.fullmatch(r'[0-9]+\.0+', s) else s
+
+def safe_ident(value):
+    value = str(value).replace('${projectKey}', PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*', value):
+        raise RuntimeError('Unexpected table identifier')
+    return '"' + value + '"'
+
+def physical(dataset, required):
+    project = dataiku.api_client().get_project(PROJECT)
+    params = project.get_dataset(dataset).get_settings().get_raw().get('params') or {}
+    if params.get('connection') != SNOW:
+        raise RuntimeError('Unexpected Snowflake source for ' + dataset)
+    present = {str(c['name']).upper() for c in dataiku.Dataset(dataset,project_key=PROJECT).read_schema()}
+    if not set(required).issubset(present):
+        raise RuntimeError('Missing required columns in ' + dataset + ': ' + str(sorted(set(required)-present)))
+    return safe_ident(params['schema']) + '.' + safe_ident(params['table'])
+
+def query(connection, title, statement, max_rows):
+    if not re.match(r'^\s*(SELECT|WITH)\b', statement, re.I):
+        raise RuntimeError('Only read-only SQL permitted')
+    log('QUERY START | ' + title)
+    begin = time.monotonic()
+    try:
+        x = SQLExecutor2(connection=connection).query_to_df(statement)
+    except Exception as exc:
+        log('QUERY FAILED | %s | %s' % (title, type(exc).__name__))
+        raise RuntimeError('Read-only source query failed: ' + title) from None
+    if len(x) > max_rows:
+        raise RuntimeError('Source query exceeds safety row limit for ' + title)
+    x.columns = [str(c).upper() for c in x.columns]
+    log('QUERY DONE | %s | %d rows | %.1fs' % (title,len(x),time.monotonic()-begin))
+    return x
+
+def chunks(values):
+    # Dataiku/Oracle may return source references as integer or float. Always
+    # canonicalize identifiers before sorting and building any Oracle IN list.
+    values = sorted(set(v for v in (norm(x) for x in values)
+                        if v is not None and len(v) <= 100
+                        and all(ord(ch) >= 32 for ch in v)))
+    for k in range(0, len(values), MAX_BATCH_KEYS):
+        yield values[k:k + MAX_BATCH_KEYS]
+
+def ora_in(values):
+    values = [norm(v) for v in values]
+    if (not values or len(values) > MAX_BATCH_KEYS or
+        any(v is None or len(v) > 100 or any(ord(ch) < 32 for ch in v)
+            for v in values)):
+        raise RuntimeError('Invalid Oracle key batch')
+    return '(' + ','.join("'" + v.replace("'", "''") + "'" for v in values) + ')'
+
+def source_text(v, marker):
+    # Oracle SQL prefixes identifiers, preventing drivers from inferring numeric
+    # and losing leading zeros / precision on long reference IDs.
+    raw = norm(v)
+    if raw is None:
+        return None
+    if not raw.startswith(marker):
+        raise RuntimeError('Unexpected source identifier representation')
+    return norm(raw[len(marker):])
+
+def as_date(s):
+    v = norm(s)
+    if not v:
+        return pd.NaT
+    if re.fullmatch(r'\d{8}',v):
+        return pd.to_datetime(v,format='%Y%m%d',errors='coerce')
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}',v):
+        return pd.to_datetime(v,format='%Y-%m-%d',errors='coerce')
+    return pd.NaT
+
+def after211(s):
+    s = norm(s)
+    return s.split('211',1)[1] if s and '211' in s and s.split('211',1)[1] else None
+
+
+# Output must be created/configured in the Flow BEFORE running this recipe.
+OUTPUT_MONTHLY = 'limit_utilisation_monthly_Corporate'
+ORIGINAL_PROTECTED = {
+    'limit_utilisation_signals_Corporate', 'results_EWS_Corporate',
+    'results_Corporate_EWS_validation', 'EWS_training_Corporate',
+}
+if OUTPUT_MONTHLY in ORIGINAL_PROTECTED:
+    raise RuntimeError('Output name conflicts with protected dataset')
+_project = dataiku.api_client().get_project(PROJECT)
+_known = {r['name'] for r in _project.list_datasets()}
+OUTPUT_FEATURES = 'limit_utilisation_features_Corporate'
+if OUTPUT_FEATURES in ORIGINAL_PROTECTED or OUTPUT_FEATURES == OUTPUT_MONTHLY:
+    raise RuntimeError('Feature output conflicts with protected dataset')
+if OUTPUT_MONTHLY not in _known or OUTPUT_FEATURES not in _known:
+    raise RuntimeError('Create BOTH managed Flow output datasets before running')
+_out_params = _project.get_dataset(OUTPUT_MONTHLY).get_settings().get_raw().get('params') or {}
+if _out_params.get('connection') != SNOW:
+    raise RuntimeError('Monthly output must use DEV_AA_TEAMS connection')
+if str(_out_params.get('schema','')).upper() != 'RRG':
+    raise RuntimeError('Monthly output must use schema RRG')
+_out_table = str(_out_params.get('table','')).replace('${projectKey}', PROJECT).upper()
+if not _out_table or not re.fullmatch(r'[A-Z_][A-Z0-9_$]*', _out_table):
+    raise RuntimeError('Invalid physical output table')
+for _name in ORIGINAL_PROTECTED:
+    if _name not in _known:
+        continue
+    _p = _project.get_dataset(_name).get_settings().get_raw().get('params') or {}
+    _t = str(_p.get('table','')).replace('${projectKey}',PROJECT).upper()
+    if (_p.get('connection') == SNOW and str(_p.get('schema','')).upper() == 'RRG'
+        and _t == _out_table):
+        raise RuntimeError('Monthly output aliases protected table: ' + _name)
+
+
+_feature_params = _project.get_dataset(OUTPUT_FEATURES).get_settings().get_raw().get('params') or {}
+if (_feature_params.get('connection') != SNOW or
+    str(_feature_params.get('schema','')).upper() != 'RRG'):
+    raise RuntimeError('Features output must use DEV_AA_TEAMS / RRG')
+_feature_table = str(_feature_params.get('table','')).replace('${projectKey}',PROJECT).upper()
+if (not _feature_table or not re.fullmatch(r'[A-Z_][A-Z0-9_$]*',_feature_table)
+    or _feature_table==_out_table):
+    raise RuntimeError('Feature output has invalid or conflicting physical table')
+for _name in ORIGINAL_PROTECTED:
+    if _name not in _known: continue
+    _p = _project.get_dataset(_name).get_settings().get_raw().get('params') or {}
+    _t = str(_p.get('table','')).replace('${projectKey}',PROJECT).upper()
+    if (_p.get('connection')==SNOW and str(_p.get('schema','')).upper()=='RRG'
+        and _t==_feature_table):
+        raise RuntimeError('Features output aliases protected table: '+_name)
+
+log('START | CORPORATE EWS | REVOLVING LIMIT UTILISATION | TYPES 1001 AND 20')
+log('INPUT QUERIES READ ONLY | only the new monthly output will be written')
+log('RULE | any LIMIT_ID linked to >1 ENTITY_ID => exclude affected entity-month')
+loan_table = physical('vars_loan_level',('ENTITY_ID','INSTRUMENT_ID','CONTRACT_ID','NOMINAL_AMOUNT','MAP_DTE'))
+
+# Defensive source-schema check: no guessed RFO/Regulatory join columns.
+required_oracle = {
+    ('BDL_LOANS_PLY','LIMIT_MON_VW'):{'MAP_DTE','LIMIT_ID','LIMIT_AMOUNT_CTV'},
+    ('BDL_CREDIT_INSIGHT_PLY','INSTRUMENT_DAY_VW'):{'MAP_DTE','INSTRUMENT_ID','INSTRUMENT_TYPE'},
+    ('BDL_CREDIT_INSIGHT_PLY','INSTRUMENT_REGULATORY_METRICS_VW'):{
+        'SOURCE_CONTRACT_REFERENCE','SOURCE_VERSION_ID','OUTSTANDING_NOMINAL_AMOUNT','INSTRUMENT_ID'},
+    ('DTM_RFO_PLY','LOANDEPO_VW'):{'CONTRACT_REFERENCE','REPORT_DATEKEY','REPORT_VERSIONID'},
+    ('DTM_RFO_PLY','ACCOUNT_VW'):{'ACCOUNT_REFERENCE','REPORT_DATEKEY','REPORT_VERSIONID'},
+}
+conditions = ' OR '.join("(OWNER='%s' AND TABLE_NAME='%s')" % k for k in required_oracle)
+# Select ONLY required column names. The old full ALL_TAB_COLUMNS scan returned
+# more than the 500-row safety cap even though only 13 fields were needed.
+required_names = sorted(set().union(*required_oracle.values()))
+names_in = '(' + ','.join("'" + x + "'" for x in required_names) + ')'
+meta = query(ORACLE, 'ORACLE REQUIRED COLUMN METADATA',
+    'SELECT OWNER,TABLE_NAME,COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE (' +
+    conditions + ') AND COLUMN_NAME IN ' + names_in,
+    len(required_oracle) * len(required_names) + 10)
+found = {(o,t):set(x['COLUMN_NAME'].astype(str)) for (o,t),x in
+         meta.groupby(['OWNER','TABLE_NAME'])}
+for obj,required in required_oracle.items():
+    missing=required-found.get(obj,set())
+    if missing: raise RuntimeError('Required Oracle source columns absent in %s: %s' % (obj,sorted(missing)))
+
+months_filter=''
+if PREVIEW_MONTHS is not None:
+    verified=tuple(str(x) for x in PREVIEW_MONTHS)
+    if not verified or any(not re.fullmatch(r'20\d{2}-(0[1-9]|1[0-2])',x) for x in verified):
+        raise RuntimeError('Invalid preview months')
+    months_filter=" AND TO_CHAR(DATE_TRUNC('MONTH',TO_DATE(MAP_DTE)),'YYYY-MM') IN (%s)" % ','.join("'"+m+"'" for m in verified)
+
+snapshot_sql="""SELECT TO_CHAR(DATE_TRUNC('MONTH',TO_DATE(MAP_DTE)),'YYYY-MM') YM,
+ MAX(TO_DATE(MAP_DTE)) AS SNAPSHOT FROM {table}
+ WHERE TO_DATE(MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}' {where}
+ GROUP BY 1 ORDER BY 1""".format(table=loan_table,start=TRAIN_START,end=TRAIN_END,where=months_filter)
+snapshots=query(SNOW,'LOAN MONTH-END SNAPSHOT LIST',snapshot_sql,40)
+if snapshots.empty: raise RuntimeError('No loan snapshots found')
+log('EXECUTION MONTHS | %d | %s' % (len(snapshots),'PREVIEW' if PREVIEW_MONTHS else 'HISTORICAL'))
+
+all_entity=[]
+all_qa=[]
+all_limit=[]
+reg_cache={}  # (SOURCE_CONTRACT_REFERENCE, SOURCE_VERSION_ID) -> grouped result/None
+for mi,snapshot_record in snapshots.iterrows():
+    ym=str(snapshot_record['YM'])
+    snapshot=pd.Timestamp(snapshot_record['SNAPSHOT'])
+    if snapshot.tzinfo is not None:
+        snapshot=snapshot.tz_localize(None)  # retain the source calendar day
+    snapshot=snapshot.normalize()
+    day=snapshot.strftime('%Y-%m-%d')
+    log('MONTH START | %d/%d | %s | snapshot=%s' % (mi+1,len(snapshots),ym,day))
+    month_start_t=time.monotonic()
+    loan=query(SNOW,'LOAN SNAPSHOT '+ym,
+        "SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID, "
+        "TRIM(TO_VARCHAR(INSTRUMENT_ID)) INSTRUMENT_ID, "
+        "TRIM(TO_VARCHAR(CONTRACT_ID)) CONTRACT_ID, "
+        "TRY_TO_DOUBLE(TO_VARCHAR(NOMINAL_AMOUNT)) LOAN_NOMINAL "
+        "FROM %s WHERE TO_DATE(MAP_DTE)=DATE '%s' "
+        "AND ENTITY_ID IS NOT NULL AND INSTRUMENT_ID IS NOT NULL" % (loan_table,day),
+        MAX_ROWS_PER_MONTH)
+    if loan.empty:
+        all_qa.append({'MONTH':ym,'STATUS':'NO_LOANS'})
+        continue
+    for col in ('ENTITY_ID','INSTRUMENT_ID','CONTRACT_ID'):
+        loan[col]=loan[col].map(norm)
+    loan['LOAN_NOMINAL']=pd.to_numeric(loan['LOAN_NOMINAL'],errors='coerce')
+    loan['LIMIT_ID']=loan['CONTRACT_ID'].map(after211)
+    # Remove byte-for-byte duplicates only. Conflicting duplicates block the entity.
+    loan=loan.drop_duplicates().copy()
+    # Assess shared limits before dropping conflicting duplicated instrument rows.
+    # Otherwise a discarded duplicate could hide that a limit is shared.
+    by_limit=loan.dropna(subset=['LIMIT_ID']).groupby('LIMIT_ID')['ENTITY_ID'].nunique()
+    shared_ids=set(by_limit[by_limit>1].index)
+    shared_entities=set(loan.loc[loan['LIMIT_ID'].isin(shared_ids),'ENTITY_ID'])
+    conflicted_ids=set(loan.loc[loan.duplicated(['ENTITY_ID','INSTRUMENT_ID'],keep=False),'ENTITY_ID'])
+    loan=loan.drop_duplicates(['ENTITY_ID','INSTRUMENT_ID'],keep='first')
+    all_limit.append({'MONTH':ym,'N_LIMITS_WITH_MULTIPLE_ENTITIES':len(shared_ids),
+                      'N_EXCLUDED_ENTITIES_SHARED_LIMIT':len(shared_entities)})
+    # Match historical instrument type on the exact loan snapshot date.
+    # Shared limits are assessed on the complete loan scope BEFORE filtering.
+    type_parts=[]
+    for j,batch in enumerate(chunks(loan['INSTRUMENT_ID'])):
+        q=("SELECT 'I|'||TRIM(TO_CHAR(INSTRUMENT_ID)) INSTRUMENT_ID, "
+           "COUNT(*) N_SOURCE_ROWS,COUNT(INSTRUMENT_TYPE) N_PRESENT, "
+           "COUNT(DISTINCT INSTRUMENT_TYPE) N_TYPES,MIN(INSTRUMENT_TYPE) INSTRUMENT_TYPE "
+           "FROM BDL_CREDIT_INSIGHT_PLY.INSTRUMENT_DAY_VW "
+           "WHERE MAP_DTE>=DATE '%s' AND MAP_DTE<DATE '%s'+1 "
+           "AND TRIM(TO_CHAR(INSTRUMENT_ID)) IN %s GROUP BY TRIM(TO_CHAR(INSTRUMENT_ID))"
+           % (day,day,ora_in(batch)))
+        type_parts.append(query(ORACLE,'INSTRUMENT TYPES %s BATCH %d'%(ym,j+1),q,MAX_BATCH_KEYS+10))
+    types=pd.concat(type_parts,ignore_index=True) if type_parts else pd.DataFrame(
+        columns=['INSTRUMENT_ID','N_SOURCE_ROWS','N_PRESENT','N_TYPES','INSTRUMENT_TYPE'])
+    types['INSTRUMENT_ID']=types['INSTRUMENT_ID'].map(lambda v:source_text(v,'I|'))
+    for col in ('N_SOURCE_ROWS','N_PRESENT','N_TYPES','INSTRUMENT_TYPE'):
+        types[col]=pd.to_numeric(types[col],errors='coerce')
+    if types['INSTRUMENT_ID'].duplicated().any():
+        raise RuntimeError('Duplicate instrument type aggregate')
+    types['VALID_TYPE']=types['N_TYPES'].eq(1)&types['N_PRESENT'].eq(types['N_SOURCE_ROWS'])
+    types.loc[~types['VALID_TYPE'],'INSTRUMENT_TYPE']=np.nan
+    loan=loan.merge(types[['INSTRUMENT_ID','INSTRUMENT_TYPE']],on='INSTRUMENT_ID',how='left',validate='many_to_one')
+    revolving=loan['INSTRUMENT_TYPE'].isin((1001,20))
+    unknown=loan['INSTRUMENT_TYPE'].isna()
+    # A denominator covering both revolving and non-revolving drawings cannot
+    # be used with a numerator restricted to revolving drawings only.
+    candidate_limits=set(loan.loc[revolving,'LIMIT_ID'].dropna())
+    mixed_limits=candidate_limits & set(loan.loc[~revolving,'LIMIT_ID'].dropna())
+    mixed_entities=set(loan.loc[revolving & loan['LIMIT_ID'].isin(mixed_limits),'ENTITY_ID'])
+    unknown_entities=set(loan.loc[unknown,'ENTITY_ID'])
+    conflicted_ids.update(mixed_entities | unknown_entities)
+    n_all=len(loan)
+    log('REVOLVING SCOPE | %s | total=%d | type1001=%d | type20=%d | unknown=%d | mixed_limits=%d' % (
+        ym,n_all,int(loan['INSTRUMENT_TYPE'].eq(1001).sum()),int(loan['INSTRUMENT_TYPE'].eq(20).sum()),int(unknown.sum()),len(mixed_limits)))
+    if unknown.all():
+        raise RuntimeError('No historical instrument type matches for '+ym+'; output not replaced')
+    loan=loan.loc[revolving].copy()
+    if loan.empty:
+        all_qa.append({'MONTH':ym,'STATUS':'NO_REVOLVING_LOANS','LOAN_ROWS':0})
+        continue
+    keys=set(loan['LIMIT_ID'].dropna())
+    limit_parts=[]
+    # Exact as-of snapshot: never use a future October 31 value for October 29.
+    limit_date_frame=query(ORACLE,'LIMIT SNAPSHOT DATE '+ym,
+        "SELECT MAX(TRUNC(MAP_DTE)) SNAPSHOT FROM BDL_LOANS_PLY.LIMIT_MON_VW "
+        "WHERE MAP_DTE<DATE '%s'+1"%day, 2)
+    source_date=pd.to_datetime(limit_date_frame['SNAPSHOT'].iloc[0],errors='coerce') if not limit_date_frame.empty else pd.NaT
+    if isinstance(source_date,pd.Timestamp) and source_date.tzinfo:
+        source_date=source_date.tz_localize(None)
+    lag_days=(snapshot-source_date.normalize()).days if pd.notna(source_date) else None
+    source_ok=lag_days is not None and 0<=lag_days<=MAX_LIMIT_STALENESS_DAYS
+    if source_ok:
+        master_day=source_date.strftime('%Y-%m-%d')
+        for j,batch in enumerate(chunks(keys)):
+            part=query(ORACLE,'LIMIT MASTER %s BATCH %d'%(ym,j+1),
+              "SELECT 'L|'||TRIM(TO_CHAR(LIMIT_ID)) LIMIT_ID, "
+              "COUNT(*) N_SOURCE_ROWS, COUNT(LIMIT_AMOUNT_CTV) N_PRESENT, "
+              "COUNT(DISTINCT LIMIT_AMOUNT_CTV) N_AMOUNT_VALUES, "
+              "MIN(LIMIT_AMOUNT_CTV) LIMIT_EUR "
+              "FROM BDL_LOANS_PLY.LIMIT_MON_VW WHERE MAP_DTE>=DATE '%s' "
+              "AND MAP_DTE<DATE '%s'+1 "
+              "AND TRIM(TO_CHAR(LIMIT_ID)) IN %s "
+              "GROUP BY TRIM(TO_CHAR(LIMIT_ID))" % (master_day,master_day,ora_in(batch)),1000)
+            limit_parts.append(part)
+    limit_df=pd.concat(limit_parts,ignore_index=True) if limit_parts else pd.DataFrame(
+        columns=['LIMIT_ID','N_SOURCE_ROWS','N_PRESENT','N_AMOUNT_VALUES','LIMIT_EUR'])
+    # Oracle may infer numeric LIMIT_ID even if SELECT used TO_CHAR. The loan
+    # dataset always uses canonical string IDs, so normalize the master too.
+    limit_df['LIMIT_ID'] = limit_df['LIMIT_ID'].map(lambda v: source_text(v, 'L|'))
+    if len(limit_df) and limit_df['LIMIT_ID'].duplicated().any():
+        raise RuntimeError('Non-unique limit master group for '+ym)
+    for col in ('N_SOURCE_ROWS','N_PRESENT','N_AMOUNT_VALUES','LIMIT_EUR'):
+        limit_df[col]=pd.to_numeric(limit_df[col],errors='coerce')
+    limit_df['VALID_LIMIT']=limit_df['N_AMOUNT_VALUES'].eq(1)&limit_df['N_PRESENT'].eq(limit_df['N_SOURCE_ROWS'])&limit_df['LIMIT_EUR'].gt(0)
+    loan=loan.merge(limit_df[['LIMIT_ID','LIMIT_EUR','VALID_LIMIT']],on='LIMIT_ID',how='left',validate='many_to_one')
+    loan['VALID_LIMIT']=loan['VALID_LIMIT'].eq(True)
+    limit_master_key_matched = int(loan['LIMIT_EUR'].notna().sum())
+    loan['NUMERATOR_EUR']=loan['LOAN_NOMINAL'].where(loan['LOAN_NOMINAL'].ge(0))
+    loan['NUMERATOR_SOURCE']=np.where(loan['NUMERATOR_EUR'].notna(),'LOAN','MISSING')
+
+    # Only missing loan amounts need regulatory reconstruction. A bounded sample
+    # of known amounts is included for concordance QA, but never substituted.
+    pending=loan.loc[loan['NUMERATOR_EUR'].isna(),'INSTRUMENT_ID'].dropna().unique().tolist()
+    good=loan.loc[loan['NUMERATOR_EUR'].notna(),'INSTRUMENT_ID'].dropna().unique().tolist()
+    known_sample=sorted(good,key=lambda s:s[::-1])[:REG_KNOWN_QA_SAMPLE]
+    refs=sorted(set(pending)|set(known_sample))
+    rfo_parts=[]
+    # Source report-date range uses only historical dates; no forward-looking version.
+    earliest=(snapshot-pd.Timedelta(days=MAX_RFO_LOOKBACK_DAYS)).strftime('%Y%m%d')
+    latest=snapshot.strftime('%Y%m%d')
+    earliest_iso=(snapshot-pd.Timedelta(days=MAX_RFO_LOOKBACK_DAYS)).strftime('%Y-%m-%d')
+    latest_iso=day
+    # Actual REPORT_DATEKEY is text; support documented YYYYMMDD / YYYY-MM-DD.
+    date_pred=("((REPORT_DATEKEY BETWEEN '%s' AND '%s') OR "
+               "(REPORT_DATEKEY BETWEEN '%s' AND '%s'))" %
+               (earliest,latest,earliest_iso,latest_iso))
+    for batch_no,batch in enumerate(chunks(refs)):
+        for view,field in (('LOANDEPO_VW','CONTRACT_REFERENCE'),('ACCOUNT_VW','ACCOUNT_REFERENCE')):
+            # Push latest-as-of ordering down to Oracle, instead of retrieving
+            # thousands of old report versions for each source reference.
+            rfo_query = ("SELECT LOAN_REF, REPORT_DAY, REPORT_VERSION FROM ("
+                "SELECT 'R|'||TRIM(TO_CHAR({field})) LOAN_REF, "
+                "TRIM(TO_CHAR(REPORT_DATEKEY)) REPORT_DAY, "
+                "'V|'||TRIM(TO_CHAR(REPORT_VERSIONID)) REPORT_VERSION, "
+                "ROW_NUMBER() OVER (PARTITION BY TRIM(TO_CHAR({field})) "
+                "ORDER BY REPLACE(TRIM(TO_CHAR(REPORT_DATEKEY)),'-','') DESC, "
+                "CASE WHEN REGEXP_LIKE(TRIM(TO_CHAR(REPORT_VERSIONID)), "
+                "'^[0-9]+([.]0+)?$') THEN TO_NUMBER(REPORT_VERSIONID) "
+                "END DESC NULLS LAST) AS RN "
+                "FROM DTM_RFO_PLY.{view} WHERE {date_pred} "
+                "AND TRIM(TO_CHAR({field})) IN {key_values} "
+                ") WHERE RN=1").format(field=field,view=view,date_pred=date_pred,
+                                         key_values=ora_in(batch))
+            frame=query(ORACLE,'RFO %s %s BATCH %d'%(view,ym,batch_no+1),
+                        rfo_query,MAX_BATCH_KEYS+10)
+            rfo_parts.append(frame)
+    rfo=pd.concat(rfo_parts,ignore_index=True) if rfo_parts else pd.DataFrame(columns=['LOAN_REF','REPORT_DAY','REPORT_VERSION'])
+    if len(rfo):
+        # This is essential: RFO LOAN_REF can arrive as int64 from Dataiku,
+        # while INSTRUMENT_ID from the loan dataset is a string.
+        rfo['LOAN_REF']=rfo['LOAN_REF'].map(lambda v: source_text(v, 'R|'))
+        rfo['REPORT_DAY']=rfo['REPORT_DAY'].map(as_date)
+        rfo['REPORT_VERSION']=rfo['REPORT_VERSION'].map(lambda v: source_text(v, 'V|'))
+        rfo['VER_NUM']=pd.to_numeric(rfo['REPORT_VERSION'],errors='coerce')
+        rfo=rfo.dropna(subset=['LOAN_REF','REPORT_DAY','VER_NUM'])
+        rfo=rfo[rfo['REPORT_DAY'].le(snapshot)]
+        # Latest report date then highest numeric version, per confirmed rule.
+        rfo=rfo.sort_values(['LOAN_REF','REPORT_DAY','VER_NUM'],ascending=[True,False,False])
+        # Views may disagree at the latest available date. Do not select an
+        # arbitrary larger version when two report versions claim that date.
+        latest_day=rfo.groupby('LOAN_REF')['REPORT_DAY'].transform('max')
+        latest_rows=rfo.loc[rfo['REPORT_DAY'].eq(latest_day)].copy()
+        versions_at_latest=latest_rows.groupby('LOAN_REF')['REPORT_VERSION'].nunique()
+        conflict_refs=set(versions_at_latest[versions_at_latest>1].index)
+        selected=(latest_rows.loc[~latest_rows['LOAN_REF'].isin(conflict_refs)]
+                  .drop_duplicates('LOAN_REF',keep='first')
+                  [['LOAN_REF','REPORT_DAY','REPORT_VERSION']].copy())
+    else:
+        conflict_refs=set()
+        selected=pd.DataFrame(columns=['LOAN_REF','REPORT_DAY','REPORT_VERSION'])
+    reg_parts=[]
+    version_pairs = selected[['LOAN_REF','REPORT_VERSION']].dropna().drop_duplicates().copy()
+    version_pairs['LOAN_REF'] = version_pairs['LOAN_REF'].map(norm)
+    version_pairs['REPORT_VERSION'] = version_pairs['REPORT_VERSION'].map(norm)
+    uncached_pairs=version_pairs.loc[[
+        (str(r.LOAN_REF),str(r.REPORT_VERSION)) not in reg_cache
+        for r in version_pairs.itertuples(index=False)]].reset_index(drop=True)
+    log('REGULATORY VERSION CACHE | %s | total=%d | new=%d | reused=%d' % (
+        ym,len(version_pairs),len(uncached_pairs),len(version_pairs)-len(uncached_pairs)))
+    for batch_no,offset in enumerate(range(0,len(uncached_pairs),MAX_BATCH_KEYS)):
+        batch = uncached_pairs.iloc[offset:offset+MAX_BATCH_KEYS]
+        def literal(v):
+            v = norm(v)
+            if not v or len(v)>100 or any(ord(ch)<32 for ch in v):
+                raise RuntimeError('Invalid reference/version for regulatory link')
+            return "'"+v.replace("'","''")+"'"
+        rows = ['SELECT %s AS LOAN_REF, %s AS EXPECTED_VERSION FROM DUAL' %
+                (literal(r.LOAN_REF),literal(r.REPORT_VERSION))
+                for r in batch.itertuples(index=False)]
+        # Join on BOTH exact reference and historical RFO report version. A
+        # reference-only lookup would return many unrelated regulatory versions.
+        q=("WITH KEY_VERSIONS AS (" + ' UNION ALL '.join(rows) + ") "
+           "SELECT 'R|'||TRIM(TO_CHAR(r.SOURCE_CONTRACT_REFERENCE)) LOAN_REF, "
+           "'V|'||TRIM(TO_CHAR(r.SOURCE_VERSION_ID)) REG_VERSION, "
+           "COUNT(*) N_REG_ROWS, COUNT(r.OUTSTANDING_NOMINAL_AMOUNT) N_PRESENT, "
+           "COUNT(DISTINCT r.OUTSTANDING_NOMINAL_AMOUNT) N_AMOUNT_VALUES, "
+           "COUNT(DISTINCT TRIM(TO_CHAR(r.INSTRUMENT_ID))) N_REG_INSTRUMENTS, "
+           "MIN(r.OUTSTANDING_NOMINAL_AMOUNT) REG_NOMINAL "
+           "FROM BDL_CREDIT_INSIGHT_PLY.INSTRUMENT_REGULATORY_METRICS_VW r "
+           "JOIN KEY_VERSIONS k ON TRIM(TO_CHAR(r.SOURCE_CONTRACT_REFERENCE))=k.LOAN_REF "
+           "AND TRIM(TO_CHAR(r.SOURCE_VERSION_ID))=k.EXPECTED_VERSION "
+           "GROUP BY TRIM(TO_CHAR(r.SOURCE_CONTRACT_REFERENCE)), "
+           "TRIM(TO_CHAR(r.SOURCE_VERSION_ID))")
+        part=query(ORACLE,'REGULATORY VERSIONED %s BATCH %d'%(ym,batch_no+1),q,MAX_BATCH_KEYS+10)
+        if len(part):
+            part['LOAN_REF']=part['LOAN_REF'].map(lambda v: source_text(v, 'R|'))
+            part['REG_VERSION']=part['REG_VERSION'].map(lambda v: source_text(v, 'V|'))
+            if part.duplicated(['LOAN_REF','REG_VERSION']).any():
+                raise RuntimeError('Duplicated versioned regulatory aggregate in ' + ym)
+            for r in part.to_dict('records'):
+                reg_cache[(r['LOAN_REF'],r['REG_VERSION'])]=r
+        # Cache absent lookups as missing too, so later months do not re-query.
+        for r in batch.itertuples(index=False):
+            reg_cache.setdefault((str(r.LOAN_REF),str(r.REPORT_VERSION)),None)
+        reg_parts.append(part)
+    reg=pd.DataFrame([reg_cache[(str(r.LOAN_REF),str(r.REPORT_VERSION))]
+        for r in version_pairs.itertuples(index=False)
+        if reg_cache.get((str(r.LOAN_REF),str(r.REPORT_VERSION))) is not None])
+    if reg.empty:
+        reg=pd.DataFrame(columns=['LOAN_REF','REG_VERSION','N_REG_ROWS','N_PRESENT',
+                                  'N_AMOUNT_VALUES','N_REG_INSTRUMENTS','REG_NOMINAL'])
+    if len(reg):
+        reg['LOAN_REF']=reg['LOAN_REF'].map(norm)
+        reg['REG_VERSION']=reg['REG_VERSION'].map(norm)
+        for col in ('N_REG_ROWS','N_PRESENT','N_AMOUNT_VALUES','N_REG_INSTRUMENTS','REG_NOMINAL'):
+            reg[col]=pd.to_numeric(reg[col],errors='coerce')
+        reg['VALID_REG']=(reg['N_PRESENT'].eq(reg['N_REG_ROWS'])&reg['N_AMOUNT_VALUES'].eq(1)&
+                         reg['N_REG_INSTRUMENTS'].eq(1)&reg['REG_NOMINAL'].ge(0))
+        if reg.duplicated(['LOAN_REF','REG_VERSION']).any():
+            raise RuntimeError('Regulatory reference/version is not unique after grouping')
+    else:
+        reg['VALID_REG']=pd.Series(dtype=bool)
+    # If the strict reference+version join returned nothing, quantify whether the
+    # problem is the reference itself or the selected historical version.
+    # Do not use reference-only amounts for the numerator: they may be future data.
+    reg_exact_pair_count = len(reg)
+    reg_ref_only_sample_found = None
+    if len(version_pairs) and reg_exact_pair_count == 0:
+        diagnostic_keys = sorted(set(version_pairs['LOAN_REF'].dropna()))[:REG_NO_MATCH_DIAGNOSTIC_KEYS]
+        if diagnostic_keys:
+            diagnostic = query(ORACLE, 'REGULATORY REFERENCE-ONLY QA '+ym,
+                "SELECT COUNT(DISTINCT TRIM(TO_CHAR(SOURCE_CONTRACT_REFERENCE))) N_REF_FOUND, "
+                "COUNT(*) N_REG_ROWS, COUNT(DISTINCT TRIM(TO_CHAR(SOURCE_VERSION_ID))) N_REG_VERSIONS "
+                "FROM BDL_CREDIT_INSIGHT_PLY.INSTRUMENT_REGULATORY_METRICS_VW "
+                "WHERE TRIM(TO_CHAR(SOURCE_CONTRACT_REFERENCE)) IN %s" % ora_in(diagnostic_keys), 2)
+            reg_ref_only_sample_found = int(diagnostic['N_REF_FOUND'].iloc[0]) if len(diagnostic) else 0
+            log('REGULATORY ZERO EXACT VERSION MATCH | month=%s | sampled_refs=%d | reference_only_refs_found=%d | amounts_not_imputed' %
+                (ym, len(diagnostic_keys), reg_ref_only_sample_found))
+    recovery=selected.merge(reg,left_on=['LOAN_REF','REPORT_VERSION'],
+                            right_on=['LOAN_REF','REG_VERSION'],how='left',validate='one_to_one')
+    recovery['CAN_RECOVER']=recovery['VALID_REG'].eq(True)
+    loan=loan.merge(recovery[['LOAN_REF','REPORT_DAY','REG_NOMINAL','CAN_RECOVER']],
+                    left_on='INSTRUMENT_ID',right_on='LOAN_REF',how='left',validate='many_to_one')
+    # Preserve float64 even if Oracle returned zero regulatory rows; avoid object
+    # division and deprecated assignment into incompatible empty columns.
+    loan['NUMERATOR_EUR'] = pd.to_numeric(loan['NUMERATOR_EUR'], errors='coerce').astype('float64')
+    loan['REG_NOMINAL'] = pd.to_numeric(loan['REG_NOMINAL'], errors='coerce').astype('float64')
+    recoverable=(loan['NUMERATOR_EUR'].isna() & loan['CAN_RECOVER'].eq(True)
+                 & loan['REG_NOMINAL'].notna())
+    if bool(recoverable.any()):
+        loan.loc[recoverable,'NUMERATOR_EUR']=loan.loc[recoverable,'REG_NOMINAL'].to_numpy(dtype='float64')
+        loan.loc[recoverable,'NUMERATOR_SOURCE']='REGULATORY_RFO_VERSION'
+    # Currency/amount reconciliation: show differences but do not alter known loans.
+    comparable=loan['LOAN_NOMINAL'].notna()&loan['REG_NOMINAL'].notna()&loan['CAN_RECOVER'].eq(True)
+    diff=(loan.loc[comparable,'LOAN_NOMINAL']-loan.loc[comparable,'REG_NOMINAL']).abs()
+    same_day_comparable=comparable & loan['REPORT_DAY'].eq(snapshot)
+    diff_same_day=(loan.loc[same_day_comparable,'LOAN_NOMINAL'] -
+                   loan.loc[same_day_comparable,'REG_NOMINAL']).abs()
+    loan['SHARED_LIMIT']=loan['ENTITY_ID'].isin(shared_entities)
+    loan['DUPLICATE_CONFLICT']=loan['ENTITY_ID'].isin(conflicted_ids)
+    loan['ROW_COMPLETE']=(loan['NUMERATOR_EUR'].notna()&loan['VALID_LIMIT']&
+                          loan['LIMIT_ID'].notna()&~loan['SHARED_LIMIT']&~loan['DUPLICATE_CONFLICT'])
+    entity_agg=loan.groupby('ENTITY_ID').agg(
+        N_LOANS=('INSTRUMENT_ID','size'),
+        N_MISSING_NUMERATORS=('NUMERATOR_EUR',lambda x:int(x.isna().sum())),
+        N_RECOVERED_NUMERATORS=('NUMERATOR_SOURCE',lambda x:int(x.eq('REGULATORY_RFO_VERSION').sum())),
+        N_MISSING_OR_INVALID_LIMITS=('VALID_LIMIT',lambda x:int((~x).sum())),
+        HAS_SHARED_LIMIT=('SHARED_LIMIT','any'),
+        HAS_DUPLICATE_CONFLICT=('DUPLICATE_CONFLICT','any'),
+        ALL_ROWS_COMPLETE=('ROW_COMPLETE','all'),
+        DRAWN_EUR=('NUMERATOR_EUR',lambda x:x.sum(min_count=1))
+    ).reset_index()
+    denominators=(loan.dropna(subset=['LIMIT_ID'])
+                  .drop_duplicates(['ENTITY_ID','LIMIT_ID'])
+                  .groupby('ENTITY_ID')['LIMIT_EUR'].sum(min_count=1).rename('LIMIT_EUR'))
+    entity_agg=entity_agg.merge(denominators,left_on='ENTITY_ID',right_index=True,how='left',validate='one_to_one')
+    # np.where() is not a conditional evaluator: its division branch runs even
+    # when VALID_RATIO=False. Use np.divide(where=...) on validated float arrays.
+    entity_agg['DRAWN_EUR'] = pd.to_numeric(entity_agg['DRAWN_EUR'], errors='coerce').astype('float64')
+    entity_agg['LIMIT_EUR'] = pd.to_numeric(entity_agg['LIMIT_EUR'], errors='coerce').astype('float64')
+    drawn = entity_agg['DRAWN_EUR'].to_numpy(dtype='float64')
+    available_limit = entity_agg['LIMIT_EUR'].to_numpy(dtype='float64')
+    valid_ratio = (entity_agg['ALL_ROWS_COMPLETE'].to_numpy(dtype=bool)
+                   & np.isfinite(drawn) & np.isfinite(available_limit)
+                   & (available_limit > 0) & bool(source_ok))
+    result_ratio = np.full(len(entity_agg), np.nan, dtype='float64')
+    np.divide(100.0 * drawn, available_limit, out=result_ratio, where=valid_ratio)
+    entity_agg['VALID_RATIO'] = valid_ratio
+    entity_agg['UTILISATION_PCT'] = result_ratio
+    if not np.isfinite(result_ratio[valid_ratio]).all():
+        raise RuntimeError('Valid limit utilisation ratio contains NaN or infinity')
+    entity_agg['AS_OF_DATE']=snapshot
+    entity_agg['MONTH']=ym
+    entity_agg['LIMIT_SOURCE_DATE']=source_date
+    entity_agg['LIMIT_SOURCE_LAG_DAYS']=lag_days
+    all_entity.append(entity_agg)
+    all_qa.append({
+        'MONTH':ym,'LOAN_SNAPSHOT':day,'LOAN_ROWS':len(loan),'LOAN_ENTITIES':loan['ENTITY_ID'].nunique(),
+        'LIMIT_SOURCE_DATE':source_date.strftime('%Y-%m-%d') if pd.notna(source_date) else None,
+        'LIMIT_SOURCE_LAG_DAYS':lag_days,'LIMIT_SOURCE_VALID':source_ok,
+        'SHARED_LIMIT_IDS_EXCLUDED':len(shared_ids), 'ENTITIES_EXCLUDED_SHARED_LIMIT':len(shared_entities),
+        'LOAN_ROWS_WITH_MASTER_LIMIT_ID_MATCH':limit_master_key_matched,
+        'LOANS_WITH_MISSING_SOURCE_NOMINAL':int(loan['LOAN_NOMINAL'].isna().sum()),
+        'LOANS_RECOVERED_RFO_REGULATORY':int(recoverable.sum()),
+        'LOANS_STILL_MISSING_NUMERATOR':int(loan['NUMERATOR_EUR'].isna().sum()),
+        'RFO_REFERENCES_SELECTED':len(selected),'RFO_VERSION_CONFLICT_REFS':len(conflict_refs),
+        'LOAN_ROWS_WITH_SELECTED_RFO_REFERENCE':int(loan['LOAN_REF'].notna().sum()),
+        'REGULATORY_MATCHED_REF_VERSION':reg_exact_pair_count,
+        'REGULATORY_REFERENCE_ONLY_QA_FOUND':reg_ref_only_sample_found,
+        'KNOWN_LOANS_COMPARABLE':int(comparable.sum()),
+        'KNOWN_LOANS_REG_DIFFER_GT_1_EUR':int(diff.gt(1).sum()),
+        'KNOWN_SAME_DAY_COMPARABLE':int(same_day_comparable.sum()),
+        'KNOWN_SAME_DAY_DIFFER_GT_1_EUR':int(diff_same_day.gt(1).sum()),
+        'STRICT_COMPLETE_ENTITIES':int(entity_agg['VALID_RATIO'].sum()),
+        'ABOVE_100PCT':int(entity_agg['UTILISATION_PCT'].gt(100).sum())})
+    log('MONTH DONE | %s | strictly complete=%d / %d; recovered=%d; exact version refs=%d; shared entities excluded=%d' %
+        (ym,int(entity_agg['VALID_RATIO'].sum()),len(entity_agg),int(recoverable.sum()),reg_exact_pair_count,len(shared_entities)))
+    log('MONTH ELAPSED | %s | %.1fs' % (ym,time.monotonic()-month_start_t))
+
+LIMIT_UTILISATION_ENTITY_MONTHLY=pd.concat(all_entity,ignore_index=True) if all_entity else pd.DataFrame()
+LIMIT_UTILISATION_QA=pd.DataFrame(all_qa)
+LIMIT_UTILISATION_SHARED_QA=pd.DataFrame(all_limit)
+LIMIT_UTILISATION_CROSSINGS=pd.DataFrame(columns=[
+    'ENTITY_ID','AS_OF_DATE','MONTH','UTILISATION_PCT','PREV_RATIO',
+    'INDICATOR','THRESHOLD_PCT_DIAGNOSTIC'])
+if len(LIMIT_UTILISATION_QA) != len(snapshots):
+    raise RuntimeError('Not all historical months produced a QA record')
+show('01 | LIMIT UTILISATION | MONTHLY SOURCE COVERAGE (NO IDS)',LIMIT_UTILISATION_QA)
+if not LIMIT_UTILISATION_ENTITY_MONTHLY.empty:
+    valid=LIMIT_UTILISATION_ENTITY_MONTHLY[LIMIT_UTILISATION_ENTITY_MONTHLY['VALID_RATIO']].copy()
+    summary=[]
+    for threshold in THRESHOLDS_PCT_DIAGNOSTIC:
+        summary.append({'THRESHOLD_PCT_DIAGNOSTIC':threshold,
+                        'ELIGIBLE_ENTITY_MONTHS':len(valid),
+                        'ABOVE_THRESHOLD_ENTITY_MONTHS':int(valid['UTILISATION_PCT'].ge(threshold).sum()),
+                        'UNIQUE_ENTITIES_ABOVE_THRESHOLD':int(valid.loc[
+                            valid['UTILISATION_PCT'].ge(threshold),'ENTITY_ID'].nunique())})
+    show('02 | LIMIT UTILISATION | PROVISIONAL THRESHOLD VOLUMES (NOT ALERTS)',summary)
+    show('03 | LIMIT UTILISATION | STATUS',{
+        'ENTITY_MONTH_ROWS':len(LIMIT_UTILISATION_ENTITY_MONTHLY),
+        'STRICT_COMPLETE_ENTITY_MONTHS':len(valid),
+        'EXCLUDED_SHARED_ENTITY_MONTHS':int(LIMIT_UTILISATION_ENTITY_MONTHLY['HAS_SHARED_LIMIT'].sum()),
+        'UNKNOWN_OR_INCOMPLETE_ENTITY_MONTHS':int((~LIMIT_UTILISATION_ENTITY_MONTHLY['VALID_RATIO']).sum()),
+        'WRITTEN_TO_DATASETS':False,'BACKTEST_METRICS_CALCULATED':False})
+    # Consecutive full source months only: no invented crossing if prior month missing.
+    seq=LIMIT_UTILISATION_ENTITY_MONTHLY.sort_values(['ENTITY_ID','AS_OF_DATE']).copy()
+    seq['PREV_MONTH']=seq.groupby('ENTITY_ID')['AS_OF_DATE'].shift()
+    seq['PREV_RATIO']=seq.groupby('ENTITY_ID')['UTILISATION_PCT'].shift()
+    seq['CONSECUTIVE']=(seq['PREV_MONTH'].dt.to_period('M')+1==seq['AS_OF_DATE'].dt.to_period('M'))
+    event_rows=[]
+    for threshold in THRESHOLDS_PCT_DIAGNOSTIC:
+        hit=(seq['CONSECUTIVE']&seq['VALID_RATIO']&seq['PREV_RATIO'].notna()&
+             seq['UTILISATION_PCT'].ge(threshold)&seq['PREV_RATIO'].lt(threshold))
+        events=seq.loc[hit,['ENTITY_ID','AS_OF_DATE','MONTH','UTILISATION_PCT','PREV_RATIO']].copy()
+        events['INDICATOR']='limit_utilisation'
+        events['THRESHOLD_PCT_DIAGNOSTIC']=threshold
+        event_rows.append(events)
+    LIMIT_UTILISATION_CROSSINGS=pd.concat(event_rows,ignore_index=True)
+    show('04 | LIMIT UTILISATION | STRICT NEW CROSSINGS (NOT BACKTEST ALERTS)',
+         LIMIT_UTILISATION_CROSSINGS.groupby('THRESHOLD_PCT_DIAGNOSTIC').size().reset_index(
+             name='NEW_CROSSINGS') if len(LIMIT_UTILISATION_CROSSINGS) else [])
+# Aggregate coverage and source QA. Never imply historical regulatory coverage
+# when versioned recoveries are unavailable.
+if not LIMIT_UTILISATION_QA.empty:
+    qa_cols = ('LOANS_WITH_MISSING_SOURCE_NOMINAL','LOANS_RECOVERED_RFO_REGULATORY',
+               'REGULATORY_MATCHED_REF_VERSION','STRICT_COMPLETE_ENTITIES',
+               'ENTITIES_EXCLUDED_SHARED_LIMIT','LOAN_ROWS_WITH_MASTER_LIMIT_ID_MATCH',
+               'LOAN_ROWS_WITH_SELECTED_RFO_REFERENCE')
+    summary = {k:int(pd.to_numeric(LIMIT_UTILISATION_QA.get(k, pd.Series(dtype='float64')),
+                                   errors='coerce').fillna(0).sum()) for k in qa_cols}
+    summary['MONTHS_EVALUATED'] = int(len(LIMIT_UTILISATION_QA))
+    summary['REGULATORY_RECOVERY_VALIDATED_ALL_MONTHS'] = bool(
+        summary['LOANS_WITH_MISSING_SOURCE_NOMINAL'] == 0 or
+        summary['LOANS_RECOVERED_RFO_REGULATORY'] > 0)
+    show('05 | LIMIT UTILISATION | HISTORICAL SOURCE RECOVERY SUMMARY', summary)
+    if summary['LOANS_WITH_MISSING_SOURCE_NOMINAL'] and not summary['LOANS_RECOVERED_RFO_REGULATORY']:
+        log('WARNING | Regulatory recovery returned zero valid nominal amounts; only known-loan complete ratios may be used')
+log('HISTORICAL SOURCE RECONSTRUCTION DONE | existing datasets unchanged')
+
+# Output only the historical entity/month series. Invalid values stay NULL,
+# never become zero or inferred from another entity/limit.
+if LIMIT_UTILISATION_ENTITY_MONTHLY.empty:
+    raise RuntimeError('No reconstructed history; refusing to overwrite monthly output')
+monthly = LIMIT_UTILISATION_ENTITY_MONTHLY.copy()
+if monthly[['ENTITY_ID','MONTH']].isna().any().any():
+    raise RuntimeError('Null entity/month keys')
+if monthly.duplicated(['ENTITY_ID','MONTH']).any():
+    raise RuntimeError('Non-unique entity/month in reconstructed history')
+monthly['UTILISATION_PCT'] = pd.to_numeric(monthly['UTILISATION_PCT'],errors='coerce')
+if monthly.loc[monthly['VALID_RATIO'],'UTILISATION_PCT'].isna().any():
+    raise RuntimeError('Valid entity/month has missing utilisation')
+if monthly.loc[~monthly['VALID_RATIO'],'UTILISATION_PCT'].notna().any():
+    raise RuntimeError('Invalid entity/month must not carry an eligible ratio')
+monthly['LIMIT_MONTH'] = pd.to_datetime(monthly['MONTH'].astype(str)+'-01',errors='coerce')
+if monthly['LIMIT_MONTH'].isna().any():
+    raise RuntimeError('Invalid month in output')
+
+# Engineering is computed directly from in-memory monthly history;
+# no second Oracle or Snowflake read is necessary in this combined recipe.
+THRESHOLDS_PCT = tuple(range(70, 101))  # 1pp grid, configurable
+WINDOWS = (3, 6, 9, 12)
+
+def compute_entity(group):
+    entity = group['ENTITY_ID'].iloc[0]
+    group = group.sort_values('LIMIT_MONTH')
+    # REINDEX creates explicit null months, preventing false consecutive runs.
+    idx = pd.date_range(group['LIMIT_MONTH'].min(),group['LIMIT_MONTH'].max(),freq='MS')
+    v = group.set_index('LIMIT_MONTH').reindex(idx)
+    v.index.name = 'LIMIT_MONTH'
+    present = v['ENTITY_ID'].notna()
+    v['ENTITY_ID']=entity
+    valid = v['VALID_RATIO'].fillna(False).astype(bool)
+    u = pd.to_numeric(v['UTILISATION_PCT'],errors='coerce').where(valid)
+    v['UTILISATION_PCT'] = u
+    base = u.shift(12)
+    v['UTILISATION_12M_AGO_PCT'] = base
+    v['CHANGE_12M_PP'] = u-base
+    v['CHANGE_12M_REL_PCT'] = 100.0*(u-base)/base.where(base>0)
+    for n in WINDOWS:
+        prior_max = u.shift(1).rolling(n,min_periods=n).max()
+        v['PRIOR_%dM_MAX_PCT'%n] = prior_max
+        v['CHANGE_VS_PRIOR_%dM_MAX_PP'%n] = u-prior_max
+        v['CHANGE_VS_PRIOR_%dM_MAX_REL_PCT'%n] = 100.0*(u-prior_max)/prior_max.where(prior_max>0)
+        # Monthly approximation ONLY: weights are observed calendar days up to
+        # as-of snapshot, not actual durations of intra-month utilisation.
+        dt = pd.to_datetime(v['AS_OF_DATE'],errors='coerce')
+        days = dt.dt.day.astype('float64').where(valid)
+        numerator = (u*days).rolling(n,min_periods=n).sum()
+        denominator = days.rolling(n,min_periods=n).sum()
+        v['WEIGHTED_MONTHLY_PROXY_%dM_PCT'%n] = numerator/denominator.where(denominator>0)
+    values = u.to_numpy(dtype=float)
+    for t in THRESHOLDS_PCT:
+        streak = np.zeros(len(v),dtype=np.int16)
+        proven = np.zeros(len(v),dtype=bool)
+        current_run = 0
+        known_start = False
+        seen_below = False
+        for i, x in enumerate(values):
+            if not np.isfinite(x):
+                current_run = 0
+                known_start = False
+                seen_below = False
+            elif x < t:
+                current_run = 0
+                known_start = False
+                seen_below = True
+            else:
+                if current_run == 0:
+                    known_start = seen_below
+                current_run += 1
+                streak[i] = current_run
+                proven[i] = known_start
+                seen_below = False
+        v['STREAK_GE_%d_MONTHS'%t]=streak
+        v['STREAK_GE_%d_START_KNOWN'%t]=proven
+    # Baseline crossing classification only for the old 5 threshold levels.
+    prior = u.shift(1)
+    for t in (70,80,90,95,100):
+        v['CROSSED_GE_%d'%t] = (u.ge(t)&prior.lt(t)).fillna(False)
+    v['LIMIT_MONTH'] = v.index
+    return v.loc[present].reset_index(drop=True)
+
+
+def build_features(z):
+    z = z.copy()
+    needed={'ENTITY_ID','MONTH','AS_OF_DATE','UTILISATION_PCT','VALID_RATIO'}
+    if not needed.issubset(z.columns):
+        raise RuntimeError('Missing source history fields')
+    z['ENTITY_ID'] = z['ENTITY_ID'].astype(str).str.strip()
+    z['LIMIT_MONTH'] = pd.to_datetime(z['MONTH'].astype(str).str[:7]+'-01',errors='coerce')
+    z['AS_OF_DATE'] = pd.to_datetime(z['AS_OF_DATE'],errors='coerce',utc=True).dt.tz_localize(None)
+    z['UTILISATION_PCT'] = pd.to_numeric(z['UTILISATION_PCT'],errors='coerce')
+    z['VALID_RATIO'] = z['VALID_RATIO'].fillna(False).astype(bool)
+    if z[['ENTITY_ID','LIMIT_MONTH']].isna().any().any() or z['ENTITY_ID'].eq('').any():
+        raise RuntimeError('Invalid entity/month')
+    if z.duplicated(['ENTITY_ID','LIMIT_MONTH']).any():
+        raise RuntimeError('Duplicate entity/month')
+    if z.loc[z['VALID_RATIO'],'UTILISATION_PCT'].isna().any():
+        raise RuntimeError('Valid ratio has missing utilisation')
+    parts=[]
+    for n,(_,g) in enumerate(z.groupby('ENTITY_ID',sort=False),1):
+        parts.append(compute_entity(g))
+        if n%2500==0: log('FEATURE GROUPS | entities=%d'%n)
+    if not parts: raise RuntimeError('Empty feature output')
+    out=pd.concat(parts,ignore_index=True)
+    if len(out)!=len(z) or out.duplicated(['ENTITY_ID','LIMIT_MONTH']).any():
+        raise RuntimeError('Feature rows/keys do not reconcile with monthly source')
+    if out['UTILISATION_PCT'].notna().sum() != z['VALID_RATIO'].sum():
+        raise RuntimeError('Feature eligibility does not reconcile with source')
+    core=['ENTITY_ID','MONTH','LIMIT_MONTH','AS_OF_DATE','VALID_RATIO',
+          'UTILISATION_PCT','LIMIT_SOURCE_DATE','LIMIT_SOURCE_LAG_DAYS',
+          'DRAWN_EUR','LIMIT_EUR','HAS_SHARED_LIMIT','ALL_ROWS_COMPLETE',
+          'UTILISATION_12M_AGO_PCT','CHANGE_12M_PP','CHANGE_12M_REL_PCT']
+    other=[]
+    for win in WINDOWS:
+        other += ['PRIOR_%dM_MAX_PCT'%win,'CHANGE_VS_PRIOR_%dM_MAX_PP'%win,
+                  'CHANGE_VS_PRIOR_%dM_MAX_REL_PCT'%win,
+                  'WEIGHTED_MONTHLY_PROXY_%dM_PCT'%win]
+    for t in THRESHOLDS_PCT:
+        other += ['STREAK_GE_%d_MONTHS'%t,'STREAK_GE_%d_START_KNOWN'%t]
+    other += ['CROSSED_GE_%d'%t for t in (70,80,90,95,100)]
+    out=out[[c for c in core if c in out.columns]+other].copy()
+    out=out.replace([np.inf,-np.inf],np.nan)
+    log('FEATURES QA | change12=%d | prior3=%d | prior12=%d | weighted12_proxy=%d' % (
+        int(out['CHANGE_12M_PP'].notna().sum()),
+        int(out['PRIOR_3M_MAX_PCT'].notna().sum()),
+        int(out['PRIOR_12M_MAX_PCT'].notna().sum()),
+        int(out['WEIGHTED_MONTHLY_PROXY_12M_PCT'].notna().sum())))
+    return out
+
+log('FEATURE GENERATION START | from full reconstructed monthly history')
+features=build_features(monthly)
+log('WARNING | time-weighted indicators are monthly snapshot proxies, not exact daily averages')
+log('OUTPUT START | monthly=%d rows | features=%d rows | threshold grid=%d..%d by 1pp' % (
+    len(monthly),len(features),min(THRESHOLDS_PCT),max(THRESHOLDS_PCT)))
+# Only NEW technical outputs. Existing signal stage, training and results untouched.
+dataiku.Dataset(OUTPUT_MONTHLY,project_key=PROJECT).write_with_schema(monthly)
+log('OUTPUT DONE | ' + OUTPUT_MONTHLY)
+dataiku.Dataset(OUTPUT_FEATURES,project_key=PROJECT).write_with_schema(features)
+log('OUTPUT DONE | ' + OUTPUT_FEATURES)
+log('NEXT | adapt the consolidated validation backtest to consume the new FEATURES')
+log('IMPORTANT | features are not alerts; business threshold grids still belong in backtest')

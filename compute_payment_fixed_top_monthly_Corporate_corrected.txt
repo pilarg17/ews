@@ -1,0 +1,105 @@
+# -*- coding: utf-8 -*-
+import re
+import dataiku
+import pandas as pd
+import numpy as np
+from dataiku.core.sql import SQLExecutor2
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION='DEV_AA_TEAMS'
+OUTPUT='payment_fixed_top_monthly_Corporate'
+project=dataiku.api_client().get_project(PROJECT)
+ora=SQLExecutor2(connection='PRD_BDWH')
+sf=SQLExecutor2(connection=CONNECTION)
+def physical(name):
+    p=project.get_dataset(name).get_settings().get_raw()['params']
+    if p['connection']!=CONNECTION: raise RuntimeError('Invalid connection: '+name)
+    def quote(s):
+        s=str(s).replace('${projectKey}',PROJECT)
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*',s): raise RuntimeError('Invalid table identifier')
+        return '"'+s+'"'
+    return quote(p['schema'])+'.'+quote(p['table'])
+M=physical('payment_movements_monthly_Corporate')
+O=physical(OUTPUT)
+if O==M: raise RuntimeError('Output aliases source')
+if project.get_dataset(OUTPUT).get_settings().get_raw()['params']['schema'].upper()!='RRG': raise RuntimeError('Output schema must be RRG')
+cols=ora.query_to_df("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER='BDL_PAYMENT_PLY' AND TABLE_NAME='PAYEE_VW'")
+cols=set(cols.iloc[:,0].astype(str).str.upper())
+required={'CREDIT_ACCOUNT_CUSTOMER_ID','CREDIT_PAYMENT_ID','CREDIT_AMOUNT_EUR','CREDIT_VALUE_DATE'}
+if not required.issubset(cols): raise RuntimeError('Missing source columns: '+str(required-cols))
+in_filter="AND UPPER(TRIM(p.PAYMENT_DIRECTION))='INCOMING'" if 'PAYMENT_DIRECTION' in cols else ''
+base=sf.query_to_df("SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_CHAR(TO_DATE(PAYMENT_MONTH),'YYYY-MM-DD') PAYMENT_MONTH,TO_CHAR(TO_DATE(AVAILABLE_DATE),'YYYY-MM-DD') AVAILABLE_DATE,TO_CHAR(TO_DATE(MAPPING_SOURCE_DATE),'YYYY-MM-DD') MAPPING_SOURCE_DATE,INCOMING_EUR,N_INCOMING FROM "+M)
+base.columns=base.columns.str.upper()
+
+def normalize_entity_id(values):
+    # SQL drivers can infer numeric-looking identifiers as integers.
+    # Preserve the identifier as text on both sides of the join.
+    return (values.astype('string').str.strip()
+            .str.replace(r'^(\d+)\.0+$', r'\1', regex=True)
+            .replace('', pd.NA))
+
+base['ENTITY_ID']=normalize_entity_id(base['ENTITY_ID'])
+if base.empty or base.duplicated(['ENTITY_ID','PAYMENT_MONTH']).any(): raise RuntimeError('Invalid existing monthly payment keys')
+if base[['ENTITY_ID','PAYMENT_MONTH','AVAILABLE_DATE','MAPPING_SOURCE_DATE','INCOMING_EUR','N_INCOMING']].isna().any().any(): raise RuntimeError('Missing existing monthly source keys')
+query="""
+WITH MAP_PAIRS AS (
+ SELECT DISTINCT TRIM(TO_CHAR(ENTITY_ID)) ENTITY_ID,TRIM(TO_CHAR(CUSTOMER_ID)) CUSTOMER_ID
+ FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_CUSTOMER_MON_VW
+ WHERE MAP_DTE>=DATE '{snapshot}' AND MAP_DTE<DATE '{snapshot}'+1
+ AND ENTITY_ID IS NOT NULL AND CUSTOMER_ID IS NOT NULL
+), MAP_OK AS (
+ SELECT CUSTOMER_ID,MIN(ENTITY_ID) ENTITY_ID FROM MAP_PAIRS
+ GROUP BY CUSTOMER_ID HAVING COUNT(DISTINCT ENTITY_ID)=1
+), CREDIT_BY_ID AS (
+ SELECT m.ENTITY_ID,TRIM(TO_CHAR(p.CREDIT_PAYMENT_ID)) PAYMENT_ID,
+        MIN(p.CREDIT_AMOUNT_EUR) AMOUNT_EUR,
+        COUNT(DISTINCT p.CREDIT_AMOUNT_EUR) N_AMOUNTS
+ FROM BDL_PAYMENT_PLY.PAYEE_VW p JOIN MAP_OK m
+   ON m.CUSTOMER_ID=TRIM(TO_CHAR(p.CREDIT_ACCOUNT_CUSTOMER_ID))
+ WHERE p.CREDIT_VALUE_DATE>=DATE '{lo}' AND p.CREDIT_VALUE_DATE<DATE '{hi}'
+ AND p.CREDIT_AMOUNT_EUR>=0 AND p.CREDIT_PAYMENT_ID IS NOT NULL {in_filter}
+ GROUP BY m.ENTITY_ID,TRIM(TO_CHAR(p.CREDIT_PAYMENT_ID))
+), RANKED AS (
+ SELECT ENTITY_ID,PAYMENT_ID,AMOUNT_EUR,
+ ROW_NUMBER() OVER(PARTITION BY ENTITY_ID ORDER BY AMOUNT_EUR DESC,PAYMENT_ID) RN
+ FROM CREDIT_BY_ID WHERE N_AMOUNTS=1
+), AGG AS (
+ SELECT ENTITY_ID,COUNT(*) FIXED_N_INCOMING,SUM(AMOUNT_EUR) FIXED_INCOMING_EUR,
+ SUM(CASE WHEN RN<=10 THEN AMOUNT_EUR ELSE 0 END) TOP10_EUR,
+ SUM(CASE WHEN RN<=20 THEN AMOUNT_EUR ELSE 0 END) TOP20_EUR,
+ SUM(CASE WHEN RN<=30 THEN AMOUNT_EUR ELSE 0 END) TOP30_EUR
+ FROM RANKED GROUP BY ENTITY_ID
+), CONFLICTS AS (
+ SELECT ENTITY_ID,COUNT(*) N_CONFLICTS FROM CREDIT_BY_ID WHERE N_AMOUNTS<>1 GROUP BY ENTITY_ID
+), ENTITIES AS (SELECT DISTINCT ENTITY_ID FROM MAP_OK)
+SELECT 'E|'||e.ENTITY_ID ENTITY_KEY,NVL(a.FIXED_N_INCOMING,0) FIXED_N_INCOMING,
+ NVL(a.FIXED_INCOMING_EUR,0) FIXED_INCOMING_EUR,NVL(a.TOP10_EUR,0) TOP10_EUR,
+ NVL(a.TOP20_EUR,0) TOP20_EUR,NVL(a.TOP30_EUR,0) TOP30_EUR,NVL(c.N_CONFLICTS,0) N_CONFLICTS
+FROM ENTITIES e LEFT JOIN AGG a ON e.ENTITY_ID=a.ENTITY_ID
+LEFT JOIN CONFLICTS c ON e.ENTITY_ID=c.ENTITY_ID
+"""
+frames=[]
+for month,b in base.groupby('PAYMENT_MONTH',sort=True):
+    if b.MAPPING_SOURCE_DATE.nunique()!=1 or b.AVAILABLE_DATE.nunique()!=1: raise RuntimeError('Ambiguous mapping/date '+month)
+    snapshot=str(b.MAPPING_SOURCE_DATE.iloc[0]); hi=(pd.Timestamp(month)+pd.offsets.MonthBegin(1)).strftime('%Y-%m-%d')
+    if not all(re.fullmatch(r'\d{4}-\d{2}-\d{2}',v) for v in (month,snapshot,hi)): raise RuntimeError('Invalid calendar date')
+    print('MONTH | '+month,flush=True)
+    x=ora.query_to_df(query.format(snapshot=snapshot,lo=month,hi=hi,in_filter=in_filter))
+    x.columns=x.columns.str.upper()
+    if x.empty or x.ENTITY_KEY.duplicated().any(): raise RuntimeError('Invalid source entity-month '+month)
+    if not x.ENTITY_KEY.astype('string').str.startswith('E|').fillna(False).all():
+        raise RuntimeError('Invalid Oracle entity key prefix '+month)
+    x['ENTITY_ID']=normalize_entity_id(x.ENTITY_KEY.astype('string').str.slice(2))
+    if x.ENTITY_ID.isna().any() or x.ENTITY_ID.duplicated().any():
+        raise RuntimeError('Invalid normalized Oracle entity keys '+month)
+    x=x.drop(columns='ENTITY_KEY')
+    z=b.merge(x,on='ENTITY_ID',how='left',validate='one_to_one')
+    numeric=['FIXED_N_INCOMING','FIXED_INCOMING_EUR','TOP10_EUR','TOP20_EUR','TOP30_EUR','N_CONFLICTS','INCOMING_EUR','N_INCOMING']
+    for c in numeric: z[c]=pd.to_numeric(z[c],errors='coerce')
+    z['IS_SOURCE_RECONCILED']=(z[numeric].notna().all(axis=1)&z.N_CONFLICTS.eq(0)&z.FIXED_N_INCOMING.eq(z.N_INCOMING)&(z.FIXED_INCOMING_EUR-z.INCOMING_EUR).abs().le(0.01)&z.TOP10_EUR.ge(0)&z.TOP10_EUR.le(z.TOP20_EUR)&z.TOP20_EUR.le(z.TOP30_EUR)&z.TOP30_EUR.le(z.FIXED_INCOMING_EUR+0.01)).astype(int)
+    print('QA | entities=%d | reconciled=%d | mismatched=%d | fewer_than_10=%d'%(len(z),z.IS_SOURCE_RECONCILED.sum(),len(z)-z.IS_SOURCE_RECONCILED.sum(),z.FIXED_N_INCOMING.lt(10).sum()),flush=True)
+    frames.append(z)
+result=pd.concat(frames,ignore_index=True)
+if result.duplicated(['ENTITY_ID','PAYMENT_MONTH']).any() or result.IS_SOURCE_RECONCILED.sum()==0: raise RuntimeError('Invalid fixed top monthly result')
+print('TOTAL | rows=%d | reconciled=%d'%(len(result),result.IS_SOURCE_RECONCILED.sum()),flush=True)
+dataiku.Dataset(OUTPUT,project_key=PROJECT).write_with_schema(result)
+print('FINISHED | Existing payment datasets unchanged',flush=True)

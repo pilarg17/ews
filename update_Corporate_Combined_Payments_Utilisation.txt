@@ -1,0 +1,254 @@
+# Corporate EWS - Expand the existing combined indicator threshold grid.
+# Run in the original combined notebook. No Oracle queries or new Flow objects.
+import ast
+import numpy as np
+import pandas as pd
+import dataiku
+
+
+def update_combined_grid():
+    project = dataiku.api_client().get_project('VALIDATIONEWSCORPORATEPORTFOLIODAILY')
+    project_key = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+    feature_name = 'combined_payments_utilisation_features_Corporate'
+    output_name = 'results_Corporate_Combined_Payments_Utilisation'
+    recipe_name = 'compute_results_Corporate_Combined_Payments_Utilisation'
+    export_name = 'export_results_Corporate_EWS'
+    thresholds = (10, 15, 20, 25, 30)
+    ports = {'GLOBAL', 'LARGE_CORPORATE', 'MID_CORPORATE', 'OTHER_CORPORATE', 'ADC', 'IP'}
+    variants = ('incoming_payments_limit_utilisation_12m_relative', 'incoming_payments_limit_utilisation_12m_pp')
+    keys = ['PORTFOLIO', 'INDICATOR', 'THRESHOLD_A', 'THRESHOLD_B']
+    expected_keys = {(p, i, a, b) for p in ports for i in variants for a in thresholds for b in thresholds}
+
+    def replace_once(s, old, new):
+        if s.count(old) != 1:
+            raise RuntimeError('Unexpected recipe structure: ' + old[:100])
+        return s.replace(old, new, 1)
+
+    def literal_assignment(code, name):
+        node = next(n for n in ast.parse(code).body if isinstance(n, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == name for t in n.targets))
+        return node, ast.literal_eval(node.value)
+
+    def replace_assignment(code, name, value):
+        node, _ = literal_assignment(code, name)
+        lines = code.splitlines(keepends=True)
+        return ''.join(lines[:node.lineno-1]) + name + ' = ' + repr(value) + '\n' + ''.join(lines[node.end_lineno:])
+
+    def dataset(name):
+        return dataiku.Dataset(name, project_key=project_key)
+
+    # 1. Read the existing successful results and persisted features.
+    feature_ds, output_ds = dataset(feature_name), dataset(output_name)
+    settings = project.get_recipe(recipe_name).get_settings()
+    old_code = settings.get_code()
+    old_results = output_ds.get_dataframe()
+    old_results.columns = old_results.columns.str.upper()
+    baseline = old_results.loc[old_results.THRESHOLD_A.eq(25) & old_results.THRESHOLD_B.eq(20)].copy()
+    assert len(baseline) == 12 and not baseline.duplicated(keys).any()
+    assert set(baseline.PORTFOLIO) == ports and set(baseline.INDICATOR) == set(variants)
+    assert baseline.loc[baseline.PORTFOLIO.eq('GLOBAL'), 'N_TP'].eq(0).all()
+    assert dict(zip(baseline.loc[baseline.PORTFOLIO.eq('GLOBAL'), 'INDICATOR'], baseline.loc[baseline.PORTFOLIO.eq('GLOBAL'), 'N_FP'])) == dict(zip(variants, (12, 6)))
+    features = feature_ds.get_dataframe()
+    features.columns = features.columns.str.upper()
+    assert len(features) == 10594
+    features['ENTITY_ID'] = features.ENTITY_ID.astype(str).str.replace(r'\.0+$', '', regex=True).str.strip()
+    for col in ('MONTH', 'AS_OF_DATE'):
+        features[col] = pd.to_datetime(features[col], utc=True).dt.tz_localize(None).dt.normalize()
+    assert not features.duplicated(['ENTITY_ID','MONTH','INDICATOR']).any()
+    assert features.N_UTIL_LATEST.between(11,12).all() and features.N_UTIL_PREVIOUS.between(11,12).all()
+    assert features.HIT.isin([0,1]).all()
+    previous_cols = ['PREV_INCOMING_DECLINE_PCT','PREV_UTILISATION_CHANGE']
+    needs_previous = not set(previous_cols).issubset(features.columns)
+
+    # 2. Recover the previous calendar month's state, including December 2025.
+    # The original technical dataset contains only consecutive evaluable rows;
+    # lagging those rows alone would lose the initial and post-gap comparisons.
+    if needs_previous:
+        ns = globals()
+        if all(isinstance(ns.get(k), pd.DataFrame) for k in ('pw','uw')):
+            p, u = ns['pw'].copy(), ns['uw'].copy()
+        elif all(isinstance(ns.get(k), pd.DataFrame) for k in ('historical_utilisation','combined_early_payments')):
+            # Reuse cached Oracle history and read only the existing Snowflake monthly data.
+            from dataiku.core.sql import SQLExecutor2
+            executor = SQLExecutor2(connection='DEV_AA_TEAMS')
+            def physical(name):
+                prm=project.get_dataset(name).get_settings().get_raw()['params']
+                assert prm['connection']=='DEV_AA_TEAMS'
+                return '"'+prm['schema']+'"."'+prm['table'].replace('${projectKey}',project_key)+'"'
+            def monthly_frame(x,month_col,value_col):
+                x=x.copy(); x.columns=x.columns.str.upper()
+                x['ENTITY_ID']=x.ENTITY_ID.astype(str).str.replace(r'\.0+$','',regex=True).str.strip()
+                x=x[x.ENTITY_ID.isin(set(features.ENTITY_ID))].copy()
+                x[month_col]=pd.to_datetime(x[month_col],utc=True).dt.tz_localize(None).dt.to_period('M').dt.to_timestamp()
+                x[value_col]=pd.to_numeric(x[value_col],errors='coerce')
+                assert not x.duplicated(['ENTITY_ID',month_col]).any()
+                return x
+            ucols=['ENTITY_ID','LIMIT_MONTH','VALID_RATIO','UTILISATION_PCT']
+            u0=monthly_frame(ns['historical_utilisation'][ucols],'LIMIT_MONTH','UTILISATION_PCT')
+            u1=monthly_frame(executor.query_to_df('SELECT '+','.join(ucols)+' FROM '+physical('limit_utilisation_features_Corporate')),'LIMIT_MONTH','UTILISATION_PCT')
+            for x in (u0,u1):
+                x.loc[~x.VALID_RATIO.astype(str).str.lower().isin(['true','1','1.0'])|x.UTILISATION_PCT.lt(0)|~np.isfinite(x.UTILISATION_PCT),'UTILISATION_PCT']=np.nan
+            u=pd.concat([u0[u0.LIMIT_MONTH.lt(pd.Timestamp('2024-12-01'))],u1[u1.LIMIT_MONTH.ge(pd.Timestamp('2024-12-01'))]]).pivot(index='ENTITY_ID',columns='LIMIT_MONTH',values='UTILISATION_PCT')
+            pcols=['ENTITY_ID','PAYMENT_MONTH','AVAILABLE_DATE','INCOMING_EUR']
+            p0=monthly_frame(ns['combined_early_payments'][pcols],'PAYMENT_MONTH','INCOMING_EUR')
+            p1=monthly_frame(executor.query_to_df('SELECT '+','.join(pcols)+' FROM '+physical('payment_movements_monthly_Corporate')),'PAYMENT_MONTH','INCOMING_EUR')
+            p=pd.concat([p0,p1],ignore_index=True)
+            assert not p.duplicated(['ENTITY_ID','PAYMENT_MONTH']).any()
+            assert pd.to_datetime(p.AVAILABLE_DATE,utc=True).dt.tz_localize(None).dt.normalize().eq(p.PAYMENT_MONTH+pd.offsets.MonthEnd(0)).all()
+            p=p.pivot(index='ENTITY_ID',columns='PAYMENT_MONTH',values='INCOMING_EUR')
+            print('REUSE | Cached history and existing Snowflake monthly features',flush=True)
+        else:
+            raise RuntimeError('Open the original combined notebook containing pw and uw (or historical_utilisation and combined_early_payments). Stored crossing rows alone lack the initial previous state. No changes made.')
+        for x in (p,u):
+            x.index = x.index.astype(str).str.replace(r'\.0+$', '', regex=True).str.strip()
+            x.columns = pd.to_datetime(x.columns, utc=True).tz_localize(None).to_period('M').to_timestamp()
+            assert x.index.is_unique and x.columns.is_unique
+        months = pd.date_range('2024-01-01','2026-09-01',freq='MS')
+        ids = pd.Index(features.ENTITY_ID.unique())
+        p, u = (x.reindex(index=ids,columns=months).astype(float) for x in (p,u))
+        def rolling(x,n): return x.T.rolling(12,min_periods=n).mean().T
+        def count(x): return x.notna().astype(int).T.rolling(12,min_periods=1).sum().T
+        pa, ua = rolling(p,12), rolling(u,11)
+        pb, ub = pa.shift(12,axis=1), ua.shift(12,axis=1)
+        pc, uc = count(p), count(u)
+        valid = pc.eq(12) & pc.shift(12,axis=1).eq(12) & uc.ge(11) & uc.shift(12,axis=1).ge(11) & pb.gt(0) & u.notna()
+        decline = (100*(1-pa/pb)).where(valid)
+        changes = {variants[0]:(100*(ua/ub.where(ub.gt(0))-1)).where(valid), variants[1]:(ua-ub).where(valid)}
+        parts = []
+        for ind, change in changes.items():
+            state = pd.concat({
+                'INCOMING_DECLINE_PCT':decline.stack(),
+                'UTILISATION_CHANGE':change.stack(),
+                previous_cols[0]:decline.shift(1,axis=1).stack(),
+                previous_cols[1]:change.shift(1,axis=1).stack(),
+            },axis=1).dropna()
+            state.index.names = ['ENTITY_ID','MONTH']
+            state = state.reset_index()
+            state['INDICATOR'] = ind
+            parts.append(state)
+        state = pd.concat(parts,ignore_index=True)
+        join = ['ENTITY_ID','MONTH','INDICATOR']
+        old = features.merge(state,on=join,how='outer',suffixes=('','_CONTROL'),indicator=True,validate='one_to_one')
+        assert len(old) == len(features) and old['_merge'].eq('both').all(), 'Original monthly eligibility mismatch'
+        for c in ('INCOMING_DECLINE_PCT','UTILISATION_CHANGE'):
+            assert np.allclose(old[c],old[c+'_CONTROL'],atol=1e-8,rtol=1e-8), 'Original feature mismatch: '+c
+            # Use original full-precision values for exact crossing boundaries.
+            old[c] = old.pop(c+'_CONTROL')
+        features = old.drop(columns='_merge')
+    for c in ['INCOMING_DECLINE_PCT','UTILISATION_CHANGE'] + previous_cols:
+        features[c] = pd.to_numeric(features[c],errors='raise')
+        assert np.isfinite(features[c]).all(), 'Invalid state: '+c
+    current = features.INCOMING_DECLINE_PCT.gt(25) & features.UTILISATION_CHANGE.gt(20)
+    previous = features.PREV_INCOMING_DECLINE_PCT.gt(25) & features.PREV_UTILISATION_CHANGE.gt(20)
+    assert (current & ~previous).astype(int).eq(features.HIT.astype(int)).all(), 'Reference 25/20 crossings do not reconcile'
+    print('PASS | 10594 observations and original 25/20 crossings',flush=True)
+
+    # 3. Expand the existing SQL. All matching and aggregation keys must include both thresholds.
+    _, sql = literal_assignment(old_code,'SQL')
+    if 'PREV_INCOMING_DECLINE_PCT' not in sql:
+        values = ','.join("('%s',%s,%s)" % (i,a,b) for i in variants for a in thresholds for b in thresholds)
+        block = '''GRID_RULES AS (
+ SELECT COLUMN1::VARCHAR INDICATOR,COLUMN2::DOUBLE THRESHOLD_A,COLUMN3::DOUBLE THRESHOLD_B
+ FROM VALUES '''+values+'''
+),
+RULE_OBS AS (
+ SELECT TRIM(TO_VARCHAR(f.ENTITY_ID)) ENTITY_ID,TO_DATE(f.AS_OF_DATE) AS_OF_DATE,
+        g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B,
+        IFF(f.INCOMING_DECLINE_PCT>g.THRESHOLD_A AND f.UTILISATION_CHANGE>g.THRESHOLD_B
+            AND NOT(f.PREV_INCOMING_DECLINE_PCT>g.THRESHOLD_A AND f.PREV_UTILISATION_CHANGE>g.THRESHOLD_B),1,0) HIT
+ FROM __FEATURE_TABLE__ f JOIN GRID_RULES g ON f.INDICATOR=g.INDICATOR
+ WHERE f.INCOMING_DECLINE_PCT IS NOT NULL AND f.UTILISATION_CHANGE IS NOT NULL
+   AND f.PREV_INCOMING_DECLINE_PCT IS NOT NULL AND f.PREV_UTILISATION_CHANGE IS NOT NULL
+),
+'''
+        assert sql.count('GRID_RULES AS (') == 1 and sql.count('MAPPED AS (') == 1
+        sql = sql[:sql.index('GRID_RULES AS (')] + block + sql[sql.index('MAPPED AS ('):]
+        for old,new in [
+            ('r.THRESHOLD_A ORDER BY p.MAP_DTE','r.THRESHOLD_A,r.THRESHOLD_B ORDER BY p.MAP_DTE'),
+            ('SELECT DISTINCT PORTFOLIO,ENTITY_ID,SIGNAL_DATE,INDICATOR,THRESHOLD_A FROM MAPPED','SELECT DISTINCT PORTFOLIO,ENTITY_ID,SIGNAL_DATE,INDICATOR,THRESHOLD_A,THRESHOLD_B FROM MAPPED'),
+            ('SELECT e.PORTFOLIO,s.INDICATOR,s.THRESHOLD_A,COUNT(DISTINCT e.EVENT_ID)','SELECT e.PORTFOLIO,s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B,COUNT(DISTINCT e.EVENT_ID)'),
+            ('GROUP BY 1,2,3\n),\nALERT_DAY','GROUP BY 1,2,3,4\n),\nALERT_DAY'),
+            ('g.THRESHOLD_A=ev.THRESHOLD_A','g.THRESHOLD_A=ev.THRESHOLD_A AND g.THRESHOLD_B=ev.THRESHOLD_B'),
+            ('SELECT a.PORTFOLIO,a.INDICATOR,a.THRESHOLD_A,COUNT(*)','SELECT a.PORTFOLIO,a.INDICATOR,a.THRESHOLD_A,a.THRESHOLD_B,COUNT(*)'),
+            ('GROUP BY 1,2,3\n),\nMETRIC_BASE','GROUP BY 1,2,3,4\n),\nMETRIC_BASE'),
+            ('m.THRESHOLD_A=a.THRESHOLD_A ORDER BY','m.THRESHOLD_A=a.THRESHOLD_A AND m.THRESHOLD_B=a.THRESHOLD_B ORDER BY'),
+        ]: sql = replace_once(sql,old,new)
+        new_code = replace_assignment(old_code,'SQL',sql)
+        new_code = replace_once(new_code,'assert len(results) == 12','assert len(results) == 300')
+        new_code = replace_once(new_code,'assert results.INDICATOR.nunique() == 2','assert results.INDICATOR.nunique() == 2\nassert set(results[keys].itertuples(index=False,name=None)) == '+repr(expected_keys)+'\nassert (results.N_TP<=results.N_EVENTS_DETECTABLE).all()')
+        new_code = new_code.replace('12 configurations','300 configurations')
+    else:
+        new_code = old_code
+    compile(new_code,recipe_name,'exec')
+
+    # Prepare the existing consolidated export update, if already installed.
+    export_settings = None
+    if export_name in {r['name'] for r in project.list_recipes()}:
+        try:
+            export_settings = project.get_recipe(export_name).get_settings()
+            export_code = export_settings.get_code()
+            _, sources = literal_assignment(export_code,'SOURCES')
+            assert sum(name==output_name for _,name,_ in sources)==1
+            sources = [(family,name,(300,) if name==output_name else expected) for family,name,expected in sources]
+            export_code = replace_assignment(export_code,'SOURCES',sources)
+            if 'assert x.groupby(\'PORTFOLIO\').size().eq(2).all()' in export_code:
+                export_code = replace_once(export_code,"assert x.groupby('PORTFOLIO').size().eq(2).all()","assert x.groupby('PORTFOLIO').size().eq(50).all()")
+            assert "assert x.groupby('PORTFOLIO').size().eq(50).all()" in export_code
+            export_code = export_code.replace('Incoming decline >25%; utilisation increase >20% relative or >20pp;', 'Incoming decline and utilisation increase: independent 10/15/20/25/30 thresholds; relative or pp;')
+            compile(export_code,export_name,'exec')
+        except Exception as exc:
+            export_settings = None
+            print("OPEN ITEM | Export layout differs; left unchanged:", str(exc), flush=True)
+
+    # 4. Persist the additional state columns, keeping the existing table and all rows.
+    if needs_previous:
+        feature_ds.write_with_schema(features)
+        stored = feature_ds.get_dataframe()
+        stored.columns = stored.columns.str.upper()
+        assert len(stored)==len(features) and stored[previous_cols].notna().all().all()
+        # Verify round-trip on the exact observation key before running the recipe.
+        for x in (stored,features):
+            x['ENTITY_ID']=x.ENTITY_ID.astype(str).str.replace(r'\.0+$','',regex=True).str.strip()
+            x['AS_OF_DATE']=pd.to_datetime(x.AS_OF_DATE,utc=True).dt.tz_localize(None).dt.normalize()
+        obs = ['ENTITY_ID','AS_OF_DATE','INDICATOR','HIT','INCOMING_DECLINE_PCT','UTILISATION_CHANGE']+previous_cols
+        pd.testing.assert_frame_equal(features[obs].sort_values(obs[:3]).reset_index(drop=True),stored[obs].sort_values(obs[:3]).reset_index(drop=True),check_dtype=False,check_exact=False,atol=1e-10,rtol=1e-10)
+        print('PASS | Existing features enriched and reconciled',flush=True)
+    if new_code != old_code:
+        settings.set_code(new_code)
+        settings.save()
+    print('RUNNING |',recipe_name,flush=True)
+    try:
+        project.get_recipe(recipe_name).run(job_type='NON_RECURSIVE_FORCED_BUILD',wait=True)
+        results = output_ds.get_dataframe()
+        results.columns = results.columns.str.upper()
+        assert len(results)==300 and set(results[keys].itertuples(index=False,name=None))==expected_keys
+        assert not results.duplicated(keys).any()
+        assert results.loc[results.PORTFOLIO.eq('ADC'),'RESULT_STATUS'].eq('NOT_APPLICABLE').all()
+        assert (results.N_TP<=results.N_EVENTS_DETECTABLE).all()
+        check_cols=keys+[c for c in baseline.columns if c not in keys+['COVERAGE_3']]
+        control=results.loc[results.THRESHOLD_A.eq(25)&results.THRESHOLD_B.eq(20)]
+        pd.testing.assert_frame_equal(baseline[check_cols].sort_values(keys).reset_index(drop=True),control[check_cols].sort_values(keys).reset_index(drop=True),check_dtype=False,check_exact=False,atol=1e-8,rtol=1e-8)
+    except Exception:
+        # Restore the previous validated results and code; extra feature columns are harmless.
+        restore = project.get_recipe(recipe_name).get_settings()
+        restore.set_code(old_code); restore.save()
+        output_ds.write_with_schema(old_results)
+        print('RESTORED | Previous recipe and results',flush=True)
+        raise
+    print('PASS | 300 configurations; 25/20 reference reconciled (except grid-relative COVERAGE_3)',flush=True)
+    if export_settings is not None:
+        try:
+            export_settings.set_code(export_code); export_settings.save()
+            print('UPDATED | Consolidated export recipe; ready to run',flush=True)
+        except Exception as exc:
+            print('OPEN ITEM | Combined grid saved; export update failed:',str(exc),flush=True)
+    else:
+        print('OPEN ITEM | Export not updated; use updated installation cell if not installed',flush=True)
+    cols=['INDICATOR','THRESHOLD_A','THRESHOLD_B','N_RAW_EPISODES','N_EVALUATED_EPISODES','N_EVENTS_DETECTABLE','N_TP','N_FP','ACCURACY','COVERAGE']
+    print('\n=== GLOBAL | ALL 50 CONFIGURATIONS ===')
+    print(results.loc[results.PORTFOLIO.eq('GLOBAL'),cols].sort_values(['N_TP','ACCURACY'],ascending=False).to_string(index=False))
+    print('\n=== MAX TP BY PORTFOLIO AND VARIANT ===')
+    print(results.groupby(['PORTFOLIO','INDICATOR']).N_TP.max().to_string())
+    return results
+
+combined_grid_results = update_combined_grid()

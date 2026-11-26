@@ -1,0 +1,198 @@
+# Run in the notebook containing historical_utilisation (January-December 2024).
+# Read-only Dataiku/Snowflake/Oracle analysis; no existing recipe or dataset is changed.
+import ast, re, numpy as np, pandas as pd, dataiku
+from dataiku.core.sql import SQLExecutor2
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION='DEV_AA_TEAMS'
+project=dataiku.api_client().get_project(PROJECT)
+exe=SQLExecutor2(connection=CONNECTION)
+if 'historical_utilisation' not in globals():
+    raise RuntimeError('Run the previously reconciled historical monthly utilisation reconstruction first (Jan-Dec 2024).')
+
+def norm_id(v):
+    if pd.isna(v): return None
+    return re.sub(r'\.0+$','',str(v).strip())
+
+def month_date(s):
+    return pd.to_datetime(s,utc=True,errors='raise').dt.tz_localize(None).dt.to_period('M').dt.to_timestamp()
+
+def physical(name):
+    p=project.get_dataset(name).get_settings().get_raw()['params']
+    assert p['connection']==CONNECTION
+    def qi(v):
+        v=str(v).replace('${projectKey}',PROJECT)
+        assert re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*',v)
+        return '"'+v+'"'
+    return qi(p['schema'])+'.'+qi(p['table'])
+
+def qry(sql):
+    x=exe.query_to_df(sql);x.columns=x.columns.str.upper();return x
+
+print('START | Combined payments and utilisation | READ ONLY',flush=True)
+U=physical('limit_utilisation_features_Corporate')
+T=physical('EWS_training_Corporate')
+# Use existing features from Dec 2024, reconstructed earlier months only.
+cols=['ENTITY_ID','LIMIT_MONTH','VALID_RATIO','UTILISATION_PCT']
+u0=historical_utilisation[cols].copy()
+u1=qry(f'''SELECT 'E|'||TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID, LIMIT_MONTH, VALID_RATIO, UTILISATION_PCT FROM {U}''')
+u1.ENTITY_ID=u1.ENTITY_ID.astype(str).str[2:]
+for x in (u0,u1):
+    x.ENTITY_ID=x.ENTITY_ID.map(norm_id)
+    x.LIMIT_MONTH=month_date(x.LIMIT_MONTH)
+    x.UTILISATION_PCT=pd.to_numeric(x.UTILISATION_PCT,errors='coerce')
+    x.loc[~x.VALID_RATIO.astype(str).str.lower().isin(['true','1','1.0']) | x.UTILISATION_PCT.lt(0) | ~np.isfinite(x.UTILISATION_PCT),'UTILISATION_PCT']=np.nan
+    assert not x.duplicated(['ENTITY_ID','LIMIT_MONTH']).any()
+control=u1.loc[u1.LIMIT_MONTH.eq(pd.Timestamp('2024-12-01')) & u1.UTILISATION_PCT.notna()].merge(u0.loc[u0.LIMIT_MONTH.eq(pd.Timestamp('2024-12-01')) & u0.UTILISATION_PCT.notna()],on=['ENTITY_ID','LIMIT_MONTH'],suffixes=('_EXISTING','_NEW'),validate='one_to_one')
+assert len(control)==int((u1.LIMIT_MONTH.eq(pd.Timestamp('2024-12-01')) & u1.UTILISATION_PCT.notna()).sum())
+assert len(control)>0 and (control.UTILISATION_PCT_EXISTING-control.UTILISATION_PCT_NEW).abs().le(.1).all()
+print('CONTROL | December valid clients reconciled:',len(control),flush=True)
+# Do not impute missing utilisation. The calendar grid restores missing months as NaN.
+u=pd.concat([u0[u0.LIMIT_MONTH.lt(pd.Timestamp('2024-12-01'))],u1[u1.LIMIT_MONTH.ge(pd.Timestamp('2024-12-01'))]],ignore_index=True)
+# No need to extract early payments for entities without enough utilisation observations.
+months=pd.date_range('2024-01-01','2026-09-01',freq='MS')
+uw=u.pivot(index='ENTITY_ID',columns='LIMIT_MONTH',values='UTILISATION_PCT').reindex(columns=months)
+# A missing current observation is allowed under the approved 11-of-12 average.
+# Still require an observed current month to issue a fresh evaluation (conservative choice).
+def rolling(x,n,min_n): return x.T.rolling(n,min_periods=min_n).mean().T
+def counts(x,n): return x.notna().astype(int).T.rolling(n,min_periods=1).sum().T
+uc=counts(uw,12);up=uc.shift(12,axis=1)
+elig_u=uc.ge(11)&up.ge(11)&uw.notna()
+uw=uw.loc[elig_u.any(axis=1)]
+if uw.empty: raise RuntimeError('No entities with two 11-of-12 utilisation windows; no valid backtest.')
+print('UTILISATION | candidate entities with two windows:',len(uw),flush=True)
+
+# Replay only the read-only monthly payment extraction of the existing recipe.
+# Uses the same payment filters, mapping, and amount aggregation as the prior Charbel implementation.
+source=project.get_recipe('compute_payment_movements_monthly_Corporate').get_settings().get_code()
+marker='# Full consecutive months only.'
+assert source.count(marker)==1,'Unexpected monthly recipe layout; inspect before running.'
+extract=source.split(marker)[0]
+assert extract.count("FIRST_MONTH='2024-09-01'")==1
+assert extract.count("LAST_COMPLETE_MONTH='2026-09-01'")==1
+extract=extract.replace("FIRST_MONTH='2024-09-01'","FIRST_MONTH='2024-01-01'",1).replace("LAST_COMPLETE_MONTH='2026-09-01'","LAST_COMPLETE_MONTH='2024-08-01'",1)
+# Preserve source extraction, prohibit dataset writes in the extracted prefix.
+for node in ast.walk(ast.parse(extract)):
+    if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute) and node.func.attr in ('write_with_schema','write_dataframe','write','get_writer','save','create','delete'):
+        raise RuntimeError('Unexpected write in monthly extraction prefix')
+# Restrict the transferred monthly payment entities after the original Corporate universe is computed.
+assert extract.count('months=pd.date_range(FIRST_MONTH,LAST_COMPLETE_MONTH,freq=\'MS\')')==1
+extract=extract.replace("months=pd.date_range(FIRST_MONTH,LAST_COMPLETE_MONTH,freq='MS')","corporate_set = corporate_set.intersection(combined_candidate_ids)\nmonths=pd.date_range(FIRST_MONTH,LAST_COMPLETE_MONTH,freq='MS')",1)
+if 'combined_early_payments' not in globals():
+    ns={'combined_candidate_ids':set(uw.index)}
+    exec(compile(extract,'<existing monthly payment extraction>','exec'),ns)
+    combined_early_payments=ns['monthly'][['ENTITY_ID','PAYMENT_MONTH','AVAILABLE_DATE','INCOMING_EUR']].copy()
+    del ns
+else:
+    print('REUSE | combined_early_payments',flush=True)
+P=physical('payment_movements_monthly_Corporate')
+p1=qry(f'''SELECT 'E|'||TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,PAYMENT_MONTH,AVAILABLE_DATE,INCOMING_EUR FROM {P}''')
+p1.ENTITY_ID=p1.ENTITY_ID.astype(str).str[2:]
+p=pd.concat([combined_early_payments,p1],ignore_index=True)
+p.ENTITY_ID=p.ENTITY_ID.map(norm_id);p.PAYMENT_MONTH=month_date(p.PAYMENT_MONTH)
+p=p[p.ENTITY_ID.isin(uw.index)].copy()
+p.INCOMING_EUR=pd.to_numeric(p.INCOMING_EUR,errors='coerce')
+assert not p.duplicated(['ENTITY_ID','PAYMENT_MONTH']).any()
+assert pd.to_datetime(p.AVAILABLE_DATE,utc=True).dt.tz_localize(None).dt.normalize().eq(p.PAYMENT_MONTH+pd.offsets.MonthEnd(0)).all()
+assert p.INCOMING_EUR.dropna().ge(0).all() and np.isfinite(p.INCOMING_EUR.dropna()).all()
+pw=p.pivot(index='ENTITY_ID',columns='PAYMENT_MONTH',values='INCOMING_EUR').reindex(index=uw.index,columns=months)
+# Fixed calendar windows, never last 12 available rows.
+pc=counts(pw,12);ppc=pc.shift(12,axis=1);uc=counts(uw,12);upc=uc.shift(12,axis=1)
+pa=rolling(pw,12,12);pb=pa.shift(12,axis=1)
+ua=rolling(uw,12,11);ub=ua.shift(12,axis=1)
+valid=pc.eq(12)&ppc.eq(12)&uc.ge(11)&upc.ge(11)&pb.gt(0)&uw.notna()
+dec=(100*(1-pa/pb)).where(valid)
+rel=(100*(ua/ub.where(ub.gt(0))-1)).where(valid)
+pp=(ua-ub).where(valid)
+# An approved 11-month average is not a permission to bridge unknown crossing states.
+# Preserve unknown states and require consecutive calendar evaluations.
+print('\n=== AVAILABLE 24M WINDOWS BEFORE CROSSING ===')
+print(pd.DataFrame({'N_VALID_24M':valid.sum(), 'N_WITH_11_MONTH_UTILISATION':(valid & (uc.eq(11)|upc.eq(11))).sum()}).to_string())
+frames=[]
+for variant,change in [('relative',rel),('pp',pp)]:
+    state=((dec.gt(25))&change.gt(20)).astype(float).where(dec.notna()&change.notna())
+    prev=state.shift(1,axis=1)
+    evaluable=state.notna()&prev.notna()
+    hits=(state.eq(1)&prev.eq(0)).astype(float).where(evaluable)
+    long=hits.stack().rename('HIT').reset_index()
+    long.columns=['ENTITY_ID','MONTH','HIT']
+    long['INDICATOR']='incoming_payments_limit_utilisation_12m_'+variant
+    for name,mat in [('INCOMING_LATEST_12M',pa),('INCOMING_PREVIOUS_12M',pb),('UTILISATION_LATEST_12M',ua),('UTILISATION_PREVIOUS_12M',ub),('N_UTIL_LATEST',uc),('N_UTIL_PREVIOUS',upc),('INCOMING_DECLINE_PCT',dec),('UTILISATION_CHANGE',change)]:
+        long=long.merge(mat.stack().rename(name).reset_index().rename(columns={'level_1':'MONTH','LIMIT_MONTH':'MONTH','PAYMENT_MONTH':'MONTH'}),on=['ENTITY_ID','MONTH'],how='left',validate='one_to_one')
+    # Use next calendar day after month-end, as payments require the full month.
+    long['AS_OF_DATE']=long.MONTH+pd.offsets.MonthBegin(1)
+    frames.append(long)
+combined_features=pd.concat(frames,ignore_index=True)
+assert not combined_features.duplicated(['ENTITY_ID','MONTH','INDICATOR']).any()
+print('\n=== COMBINED MONTHLY QA ===')
+combined_features['USES_11_MONTH_UTILISATION']=(combined_features.N_UTIL_LATEST.eq(11)|combined_features.N_UTIL_PREVIOUS.eq(11)).astype(int)
+print(combined_features.groupby(['MONTH','INDICATOR']).agg(N_EVALUABLE=('HIT','size'),N_CROSSINGS=('HIT','sum'),N_CUSTOMERS=('ENTITY_ID','nunique'),N_USES_11=('USES_11_MONTH_UTILISATION','sum')).to_string())
+if combined_features.empty: raise RuntimeError('No combined consecutive evaluations; do not report zero alerts as a performance result.')
+
+# Reuse the dedicated standard utilisation backtest SQL, without touching its producer/output.
+code=project.get_recipe('compute_results_Corporate_Limit_Utilisation').get_settings().get_code()
+node=next(n for n in ast.parse(code).body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SQL_TEMPLATE' for t in n.targets))
+template=ast.literal_eval(node.value)
+# Conservative entity-date ADC exclusion: no mixed ADC exposure in the combined entity-level signal.
+# Historical membership before training is not verified; scope is applied at evaluation/event date.
+assert template.count('SCOPE_RAW AS (')==1 and template.count('SCOPE AS (')==1
+scope='''NON_ADC AS (
+ SELECT p.* FROM ENTITY_BASE p
+ WHERE NOT EXISTS (SELECT 1 FROM LOAN_SEG a WHERE a.ENTITY_ID=p.ENTITY_ID AND a.MAP_DTE=p.MAP_DTE AND a.PORTFOLIO='ADC')
+ AND NOT EXISTS (SELECT 1 FROM LOAN_CLASS a WHERE a.ENTITY_ID=p.ENTITY_ID AND a.MAP_DTE=p.MAP_DTE AND (a.N_PURPOSE<>1 OR a.N_ROWS<>1 OR a.PURPOSE IS NULL OR a.PURPOSE NOT IN ({adc},{ip},{other},555)))
+),
+SCOPE_RAW AS (
+ SELECT p.SEGMENT PORTFOLIO,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL FROM NON_ADC p WHERE p.SEGMENT IN ('LARGE_CORPORATE','MID_CORPORATE')
+ UNION ALL
+ SELECT ls.PORTFOLIO,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL FROM NON_ADC p JOIN LOAN_SEG ls ON p.ENTITY_ID=ls.ENTITY_ID AND p.MAP_DTE=ls.MAP_DTE WHERE p.SEGMENT='OTHER_CORPORATE' AND ls.PORTFOLIO IN ('IP','OTHER_CORPORATE')
+),
+SCOPED_PORTS AS (SELECT * FROM SCOPE_RAW UNION ALL SELECT 'GLOBAL',ENTITY_ID,MAP_DTE,TARGET,EVENT_NOMINAL FROM SCOPE_RAW),
+'''
+template=template[:template.index('SCOPE_RAW AS (')]+scope+template[template.index('SCOPE AS ('):]
+template=template.replace('FROM SCOPE_RAW GROUP BY 1,2,3','FROM SCOPED_PORTS GROUP BY 1,2,3',1)
+# One row per entity/month, two evaluable variants; retain all non-alert evaluations for detectability.
+# Use compact VALUES and a size guard rather than creating untracked intermediate warehouse objects.
+obs=combined_features[['ENTITY_ID','AS_OF_DATE','INDICATOR','HIT']].copy()
+obs['VARIANT']=obs.INDICATOR.str.endswith('_pp').astype(int)
+def qlit(x): return "'"+str(x).replace("'","''")+"'"
+rows=','.join('('+','.join([qlit(r.ENTITY_ID),qlit(r.AS_OF_DATE.strftime('%Y-%m-%d')),str(int(r.VARIANT)),str(int(r.HIT))])+')' for r in obs.itertuples(index=False))
+if len(rows.encode('utf-8'))>800000: raise RuntimeError('Feature observations exceed safe inline query size. Preserve combined_features; use a dedicated technical staging dataset for the standard SQL.')
+branch='''RULE_OBS AS (
+ SELECT COLUMN1::VARCHAR ENTITY_ID,TO_DATE(COLUMN2::VARCHAR) AS_OF_DATE,
+ IFF(COLUMN3=1,'incoming_payments_limit_utilisation_12m_pp','incoming_payments_limit_utilisation_12m_relative') INDICATOR,
+ 25::DOUBLE THRESHOLD_A,20::DOUBLE THRESHOLD_B,COLUMN4::NUMBER HIT FROM VALUES '''+rows+'''
+),
+'''
+assert template.count('FEATURE_RAW AS (')==1 and template.count('MAPPED AS (')==1
+template=template[:template.index('FEATURE_RAW AS (')]+branch+template[template.index('MAPPED AS ('):]
+# Align to the first scoped date after the completed month; standard 35-day maximum.
+# Keep all six reporting rows, ADC explicitly not applicable.
+template=template.replace('COLUMN2::DOUBLE THRESHOLD_A,0::DOUBLE THRESHOLD_B','COLUMN2::DOUBLE THRESHOLD_A,20::DOUBLE THRESHOLD_B')
+# Add actual availability counts to prevent confusing zero alerts and zero evaluability.
+metric='''AVAIL_QA AS (
+ SELECT a.PORTFOLIO,a.INDICATOR,a.THRESHOLD_A,COUNT(*) N_SOURCE_EVALUATIONS,
+ COUNT_IF(p.TARGET=0 AND p.EVENT_NOMINAL>=50000 AND a.SIGNAL_DATE<=DATEADD('MONTH',-1,DATE '{end}')) N_ELIGIBLE_EVALUATIONS
+ FROM SOURCE_AVAIL a JOIN SCOPE p ON p.PORTFOLIO=a.PORTFOLIO AND p.ENTITY_ID=a.ENTITY_ID AND p.MAP_DTE=a.SIGNAL_DATE GROUP BY 1,2,3
+),
+'''
+template=template.replace('METRIC_BASE AS (',metric+'METRIC_BASE AS (',1)
+template=template.replace('FROM METRIC_BASE m ORDER BY',"FROM METRIC_BASE m LEFT JOIN AVAIL_QA a ON m.PORTFOLIO=a.PORTFOLIO AND m.INDICATOR=a.INDICATOR AND m.THRESHOLD_A=a.THRESHOLD_A ORDER BY",1)
+template=template.replace("'REVOLVING_MONTHLY_PROXY' RESULT_STATUS,", "COALESCE(a.N_SOURCE_EVALUATIONS,0) N_SOURCE_EVALUATIONS, COALESCE(a.N_ELIGIBLE_EVALUATIONS,0) N_ELIGIBLE_EVALUATIONS, CASE WHEN m.PORTFOLIO='ADC' THEN 'NOT_APPLICABLE' WHEN COALESCE(a.N_ELIGIBLE_EVALUATIONS,0)=0 THEN 'NOT_EVALUABLE' ELSE 'REVOLVING_MONTHLY_PROXY_11_OF_12' END RESULT_STATUS,")
+# ADC/IP purpose lists copied from the original backtest code.
+ADC=set(range(401,408))|set(range(412,418))|set(range(422,428))|set(range(432,438))|set(range(442,448))|{499,961,962,963,964,965,970}
+IP=set(range(452,458))|set(range(462,468))|set(range(472,478))|{966,967,968,971}
+KNOWN={11,12,14,15,16,17,21,41,42,43,44,45,46,47,101,111,112,113,114,115,116,117,118,119,120,121,123,126,127,128,130,140,201,211,214,215,216,301,311,321,331,341,351,361,362,401,402,403,404,405,406,407,412,413,414,415,416,417,422,423,424,425,426,427,432,433,434,435,436,437,442,443,444,445,446,447,452,453,454,455,456,457,462,463,464,465,466,467,472,473,474,475,476,477,481,482,483,484,485,499,501,502,503,504,555,602,603,900,901,902,903,904,920,921,922,923,924,925,926,930,931,932,940,941,960,961,962,963,964,965,966,967,968,969,970,971,980,981,982,991}
+nums=lambda x:','.join(map(str,sorted(x)))
+params=dict(T=T,B=physical('EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02'),L=physical('vars_loan_level'),E=physical('vars_entity_level_merged'),H=physical('vars_entity_level'),start='2024-11-07',end='2026-10-29',adc=nums(ADC),ip=nums(IP),other=nums(KNOWN-ADC-IP-{555}),values="('incoming_payments_limit_utilisation_12m_relative',25),('incoming_payments_limit_utilisation_12m_pp',25)")
+combined_sql=template.format(**params)
+combined_results=qry(combined_sql)
+assert len(combined_results)==12 and not combined_results.duplicated(['PORTFOLIO','INDICATOR','THRESHOLD_A','THRESHOLD_B']).any()
+assert (combined_results.N_TP+combined_results.N_FN).eq(combined_results.N_EVENTS).all()
+assert (combined_results.N_TP_ALERTS+combined_results.N_FP).eq(combined_results.N_EVALUATED_EPISODES).all()
+assert combined_results.loc[combined_results.PORTFOLIO.eq('ADC'),'N_SOURCE_EVALUATIONS'].eq(0).all()
+# Do not report performance for non-evaluable or excluded portfolios.
+blocked=combined_results.RESULT_STATUS.isin(['NOT_APPLICABLE','NOT_EVALUABLE'])
+for col in ['ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION','TOTAL_COST_CF1','TOTAL_COST']:
+    if col in combined_results: combined_results.loc[blocked,col]=np.nan
+print('\n=== COMBINED BACKTEST RESULTS ===')
+print(combined_results[['PORTFOLIO','INDICATOR','RESULT_STATUS','N_SOURCE_EVALUATIONS','N_ELIGIBLE_EVALUATIONS','N_EVENTS','N_EVENTS_DETECTABLE','N_TP','N_FP','N_FN','N_ALERTS','N_EVALUATED_EPISODES','ACCURACY','COVERAGE','COVERAGE_2','MAX_DAILY_ALERTS']].to_string(index=False))
+print('FINISHED | Combined backtest | read-only; results in combined_results and combined_features',flush=True)

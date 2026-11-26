@@ -1,0 +1,78 @@
+CORPORATE LTV – CASE REGISTER (observed QA results, 26 November 2026)
+Scope: 19 customers, 30 loans, signal date 1 July 2026, comparison 30 June 2025 vs 30 June 2026.
+
+The main driver is already established: 18 customers / 29 loans with declining allocated collateral; one customer / loan with increasing regulatory exposure. This is not a statement of property market depreciation.
+Confirmed decomposition: 2 loans / 2 customers changed valuation field (cover amount -> net market value); 3 loans / 2 customers changed allocation weight with unchanged underlying market value; 1 loan / customer had increased exposure and unchanged collateral. 24 loans / 14 customers are unresolved at protection level. The query returned 20 loans without valid pairs on both dates, 3 without valid pairs on current date, and 1 allocation mismatch. These are diagnostic statuses, not proof of missing collateral or deleted links.
+
+Source: BDL_CREDIT_INSIGHT_PLY.INSTRUMENT_REGULATORY_METRICS_DAY_VW (OUTSTANDING_NOMINAL_AMOUNT, OFF_BALANCE_SHEET_AMOUNT); INSTRUMENT_PROTECTION_DAY_VW (INSTRUMENT_ID, PROTECTION_ID); PROTECTION_DAY_VW (PROTECTION_TYPE, PROTECTION_INTERNAL_SUBTYPE_DESC); PROTECTION_METRICS_DAY_VW (NET_MARKET_VALUE_LCY, COLLATERAL_COVER_AMOUNT_LCY). Approved priority: net market value when valid, cover amount fallback. Type 8 / EUR under current calculation. Allocation proportional to linked exposure across all bank instruments. No change to calculation proposed.
+
+1. ALL 30 LOAN OBSERVATIONS – EXISTING QA
+ENTITY_ID    INSTRUMENT_ID              SIGNAL_DATE  LTV_PREVIOUS_PCT  LTV_CURRENT_PCT  LTV_INCREASE_PP  ALLOCATED_OLD  ALLOCATED_NEW  COLLATERAL_CHANGE       RECONCILIATION_STATUS
+211000002276 2110071545791111 2026-07-01T00:00:00.000Z             32.23            61.52            29.29     1000000.00      486628.02         -513371.98   NO_VALID_PAIRS_BOTH_DATES
+211000002276 2110071545791740 2026-07-01T00:00:00.000Z             42.89            61.52            18.62      875000.00      513371.98         -361628.02   NO_VALID_PAIRS_BOTH_DATES
+211000017088 2110071805101093 2026-07-01T00:00:00.000Z             48.03            71.47            23.43      427379.28      260396.11         -166983.17            FULLY_RECONCILED
+211000017088 2110071805101602 2026-07-01T00:00:00.000Z             48.03            71.47            23.43      546630.66      333867.93         -212762.73            FULLY_RECONCILED
+211000018121 2110081749813083 2026-07-01T00:00:00.000Z             58.86           165.75           106.89     1568547.07      525324.96        -1043222.11   NO_VALID_PAIRS_BOTH_DATES
+211000018121 2110081749813856 2026-07-01T00:00:00.000Z             58.86           165.75           106.89      381452.93      124675.04         -256777.89   NO_VALID_PAIRS_BOTH_DATES
+211000018946 2110091198094289 2026-07-01T00:00:00.000Z             69.20           257.37           188.17      969026.94      242024.65         -727002.29   NO_VALID_PAIRS_BOTH_DATES
+211000018946 2110091198094449 2026-07-01T00:00:00.000Z             69.20           257.37           188.17      985791.14      247508.31         -738282.83   NO_VALID_PAIRS_BOTH_DATES
+211000171086 2110091915332049 2026-07-01T00:00:00.000Z            200.77           237.21            36.45      218113.53      172447.38          -45666.15   NO_VALID_PAIRS_BOTH_DATES
+211000171086 2110091915332580 2026-07-01T00:00:00.000Z            200.77           237.21            36.45       88242.71       69511.72          -18730.99   NO_VALID_PAIRS_BOTH_DATES
+211000171086 2110091915332909 2026-07-01T00:00:00.000Z             76.49            93.93            17.44     1974950.96     1596906.47         -378044.49         ALLOCATION_MISMATCH
+211000171086 2110091915332971 2026-07-01T00:00:00.000Z            200.77           237.21            36.45       16199.98        4819.23          -11380.75   NO_VALID_PAIRS_BOTH_DATES
+211000186406 2110041100193389 2026-07-01T00:00:00.000Z             17.11            37.36            20.25     3800000.00     1740000.00        -2060000.00            FULLY_RECONCILED
+211000187791 2110046100316681 2026-07-01T00:00:00.000Z             49.61           116.89            67.28      256648.37      256648.37               0.00            FULLY_RECONCILED
+211000434344 2110091899322472 2026-07-01T00:00:00.000Z             28.95           118.06            89.10    14679360.00     3600000.00       -11079360.00            FULLY_RECONCILED
+211000552869 2110045755738484 2026-07-01T00:00:00.000Z             27.17            44.91            17.73     2643000.00     1151013.79        -1491986.21   NO_VALID_PAIRS_BOTH_DATES
+211000625760 2112000001289461 2026-07-01T00:00:00.000Z             50.85            82.65            31.80     2654842.18     1444988.77        -1209853.41            FULLY_RECONCILED
+211000640148 2110036735959124 2026-07-01T00:00:00.000Z             65.72           112.34            46.62     1192000.00      651060.13         -540939.87   NO_VALID_PAIRS_BOTH_DATES
+211000647809 2110015101381047 2026-07-01T00:00:00.000Z            253.17           366.39           113.22      153405.15       98387.80          -55017.35   NO_VALID_PAIRS_BOTH_DATES
+211000674374 2110060101437834 2026-07-01T00:00:00.000Z             64.25            97.03            32.78     1055000.00      660888.02         -394111.98   NO_VALID_PAIRS_BOTH_DATES
+211000699078 2110014340374410 2026-07-01T00:00:00.000Z             59.62            89.65            30.03     1332985.43      820559.67         -512425.76 NO_VALID_PAIRS_CURRENT_DATE
+211000699078 2110042340373365 2026-07-01T00:00:00.000Z             59.62            89.65            30.03      440589.11      267717.10         -172872.02 NO_VALID_PAIRS_CURRENT_DATE
+211000699078 2110097340377034 2026-07-01T00:00:00.000Z             59.62            89.65            30.03     5081425.45     3157723.23        -1923702.22 NO_VALID_PAIRS_CURRENT_DATE
+211000972038 2110085335881155 2026-07-01T00:00:00.000Z             65.96            82.38            16.42      596418.08      446707.06         -149711.02   NO_VALID_PAIRS_BOTH_DATES
+211000972038 2110091335887040 2026-07-01T00:00:00.000Z             65.96            82.38            16.42     1903581.92     1413292.94         -490288.98   NO_VALID_PAIRS_BOTH_DATES
+211000993906 2110050520051345 2026-07-01T00:00:00.000Z             65.39            85.15            19.76     1689000.00     1200000.00         -489000.00   NO_VALID_PAIRS_BOTH_DATES
+211001026154 2110015797594002 2026-07-01T00:00:00.000Z             83.42           105.86            22.44      601008.67      473603.32         -127405.34   NO_VALID_PAIRS_BOTH_DATES
+211001026154 2110018797599122 2026-07-01T00:00:00.000Z             83.42           105.86            22.44      378991.33      284926.77          -94064.56   NO_VALID_PAIRS_BOTH_DATES
+211001513597 2112000001311804 2026-07-01T00:00:00.000Z             69.69           141.24            71.54     3500000.00     1637686.65        -1862313.35   NO_VALID_PAIRS_BOTH_DATES
+211001534827 2110031094775554 2026-07-01T00:00:00.000Z             59.58            94.18            34.60      617000.00      369919.23         -247080.77   NO_VALID_PAIRS_BOTH_DATES
+
+2. RECOVERED PROTECTION PAIRS – EXISTING QA
+ENTITY_ID    INSTRUMENT_ID  PROTECTION_ID               PAIR_DRIVER VALUE_SOURCE_OLD VALUE_SOURCE_NEW  RAW_VALUE_OLD  RAW_VALUE_NEW  WEIGHT_OLD  WEIGHT_NEW  ALLOCATED_OLD  ALLOCATED_NEW  DECOMPOSITION_OK
+211000699078 2110014340374410 2118308771.1.1              LINK_REMOVED     COVER_AMOUNT              NaN     3770000.00            NaN      0.1945         NaN   7.330934e+05            NaN             False
+211000699078 2110014340374410 2118308771.2.1              LINK_REMOVED     COVER_AMOUNT              NaN     3085000.00            NaN      0.1945         NaN   5.998921e+05            NaN             False
+211000186406 2110041100193389 2118507837.1.1      VALUE_SOURCE_CHANGED     COVER_AMOUNT     MARKET_VALUE     3800000.00     1740000.00      1.0000      1.0000   3.800000e+06   1740000.0000              True
+211000699078 2110042340373365 2118308771.1.1              LINK_REMOVED     COVER_AMOUNT              NaN     3770000.00            NaN      0.0643         NaN   2.423079e+05            NaN             False
+211000699078 2110042340373365 2118308771.2.1              LINK_REMOVED     COVER_AMOUNT              NaN     3085000.00            NaN      0.0643         NaN   1.982812e+05            NaN             False
+211000187791 2110046100316681 2118494310.1.1                 UNCHANGED     MARKET_VALUE     MARKET_VALUE      256648.37      256648.37      1.0000      1.0000   2.566484e+05    256648.3700              True
+211000017088 2110071805101093 2118820209.5.1 ALLOCATION_WEIGHT_CHANGED     MARKET_VALUE     MARKET_VALUE     1390404.79     1390404.79      0.3074      0.1873   4.273793e+05    260396.1107              True
+211000017088 2110071805101602 2118820209.5.1 ALLOCATION_WEIGHT_CHANGED     MARKET_VALUE     MARKET_VALUE     1390404.79     1390404.79      0.3931      0.2401   5.466307e+05    333867.9326              True
+211000434344 2110091899322472 2118610512.1.1      VALUE_SOURCE_CHANGED     COVER_AMOUNT     MARKET_VALUE    14679360.00     3600000.00      1.0000      1.0000   1.467936e+07   3600000.0000              True
+211000171086 2110091915332909 2118589283.1.1     MARKET_VALUE_DECREASE     MARKET_VALUE     MARKET_VALUE      525027.67      490000.00      1.0000      1.0000   5.250277e+05    490000.0000             False
+211000171086 2110091915332909 2119118525.2.1     MARKET_VALUE_DECREASE     MARKET_VALUE     MARKET_VALUE      789126.26      530000.00      0.8839      0.8954   6.974795e+05    474562.2090             False
+211000699078 2110097340377034 2118308771.1.1              LINK_REMOVED     COVER_AMOUNT              NaN     3770000.00            NaN      0.7413         NaN   2.794599e+06            NaN             False
+211000699078 2110097340377034 2118308771.2.1              LINK_REMOVED     COVER_AMOUNT              NaN     3085000.00            NaN      0.7413         NaN   2.286827e+06            NaN             False
+211000625760 2112000001289461 2119717100.1.1 ALLOCATION_WEIGHT_CHANGED     MARKET_VALUE     MARKET_VALUE     2654842.18     2654842.18      1.0000      0.5443   2.654842e+06   1444988.7705              True
+
+FINISHED | LTV case identifiers | READ ONLY
+
+Important: LINK_REMOVED in this initial eligible-pair comparison means that the eligible pair was absent from the returned current set. Actual removal is not established unless raw source links reconcile. MARKET_VALUE_DECREASE rows for an unreconciled loan are partial evidence, not a fully confirmed loan-level driver.
+
+3. MISSING TARGET – ALL SEVEN LOAN CROSSINGS
+ENTITY_ID    INSTRUMENT_ID              SIGNAL_DATE                LTV_MONTH  PREVIOUS_LTV  CURRENT_LTV  POLICY_THRESHOLD                       POLICY_CATEGORY  EVENT_NOMINAL  TGT_DEFAULT_SAMEDAY  TGT_FORBEARANCE_SAMEDAY  TGT_DIM1_SAMEDAY  TGT_ANY_SAMEDAY  PD_CRR  DPD_MAX  SLOTTING_GRADE GRADE_CONFLICT  ACA_SLOT_ADC_ELIGIBLE             SLOTTING_STATUS
+211000015142 2110081735458022 2026-10-01T00:00:00.000Z 2026-09-30T00:00:00.000Z      0.800000     0.807017               0.8 ADC_RESIDENTIAL_LAND_EXISTING_PROJECT            NaN                    0                        0               0.0              NaN     NaN      1.0             2.0          False                      1 NON_DEFAULT_GRADE_AVAILABLE
+211000910791 2112000001282951 2026-10-01T00:00:00.000Z 2026-09-30T00:00:00.000Z      0.800000     0.985223               0.8 ADC_RESIDENTIAL_LAND_EXISTING_PROJECT      403941.50                    0                        0               0.0              NaN     NaN      1.0             3.0          False                      1 NON_DEFAULT_GRADE_AVAILABLE
+211001010049 2112000001313219 2025-11-03T00:00:00.000Z 2025-10-31T00:00:00.000Z      0.593052     1.000000               0.7                      ADC_CONSTRUCTION    19225328.50                    0                        0               0.0              NaN     NaN      0.0             NaN            NaN                      0            MISSING_SLOTTING
+211001028069 2110003815054183 2025-08-01T00:00:00.000Z 2025-07-31T00:00:00.000Z      0.700000     0.855895               0.8 ADC_RESIDENTIAL_LAND_EXISTING_PROJECT     1960000.00                    0                        0               NaN              NaN     NaN      0.0             NaN            NaN                      0            MISSING_SLOTTING
+211001482261 2110000101782558 2025-08-01T00:00:00.000Z 2025-07-31T00:00:00.000Z      0.668896     0.767677               0.7                      ADC_CONSTRUCTION     3800000.00                    0                        0               NaN              NaN     NaN      0.0             3.0          False                      1 NON_DEFAULT_GRADE_AVAILABLE
+211001482261 2110050101782535 2025-08-01T00:00:00.000Z 2025-07-31T00:00:00.000Z      0.668896     0.767677               0.7                      ADC_CONSTRUCTION     3800000.00                    0                        0               NaN              NaN     NaN      0.0             3.0          False                      1 NON_DEFAULT_GRADE_AVAILABLE
+211001510512 2110044021287555 2025-04-01T00:00:00.000Z 2025-03-31T00:00:00.000Z      0.799688     0.807520               0.8 ADC_RESIDENTIAL_LAND_EXISTING_PROJECT     6676311.89                    0                        0               0.0              NaN     NaN      2.0             NaN            NaN                      0            MISSING_SLOTTING
+
+Seven loan crossings, six customers. Three customers have valid slotting grades (2/3), three have neither PD nor slotting. All have default and forbearance flags zero; maximum observed DPD 0–2 days; DIM1 missing for two customer-date cases; one case has incomplete exposure and partial DPD coverage. Grade 2/3 does not independently establish a zero combined target. Do not recode target until agreed.
+
+4. ADC/IPRE SUMMARY
+30 Sep 2026: ADC 526 loans, 198 valid LTV, 160 mapped, 61 above policy; IPRE 196 loans, 186 valid LTV, no mapped policy. Historically ADC 2,608 mapped loan-months, 828 above policy; 32 loan-level policy crossings across 27 customers; 23 target already active, 7 unknown target, 2 incomplete exposure. 29 raw entity-date episodes; zero eligible early-warning episodes. Historical LTV data available in 14 of 24 monthly snapshots; 6 missing months may be recoverable by aligning calendar/operational month ends, not yet validated. IPRE policy mapping remains incomplete.
+
+Internal case register: IDs are bank data; retain within approved bank channels.

@@ -1,0 +1,81 @@
+# Corporate LTV | final collateral reconciliation | READ ONLY
+import dataiku
+import pandas as pd
+import numpy as np
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = "VALIDATIONEWSCORPORATEPORTFOLIODAILY"
+CONNECTION = "DEV_AA_TEAMS"
+project = dataiku.api_client().get_project(PROJECT)
+snow = SQLExecutor2(connection=CONNECTION)
+ora = SQLExecutor2(connection="PRD_BDWH")
+
+def query(exe, sql):
+    x = exe.query_to_df(sql)
+    x.columns = x.columns.str.upper()
+    return x
+
+def physical(name):
+    p = project.get_dataset(name).get_settings().get_raw()["params"]
+    assert p["connection"] == CONNECTION
+    return '"%s"."%s"' % (p["schema"], p["table"].replace("${projectKey}", PROJECT))
+
+T=physical('EWS_training_Corporate')
+B=physical('EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02')
+L=physical('vars_loan_level')
+E=physical('vars_entity_level_merged')
+H=physical('vars_entity_level')
+V=physical('ltv_monthly_Corporate')
+ADC=(set(range(401,408))|set(range(412,418))|set(range(422,428))|
+ set(range(432,438))|set(range(442,448))|{499,961,962,963,964,965,970})
+IP=(set(range(452,458))|set(range(462,468))|set(range(472,478))|{966,967,968,971})
+KNOWN={11,12,14,15,16,17,21,41,42,43,44,45,46,47,101,111,112,113,114,
+115,116,117,118,119,120,121,123,126,127,128,130,140,201,211,
+214,215,216,301,311,321,331,341,351,361,362,401,402,403,404,
+405,406,407,412,413,414,415,416,417,422,423,424,425,426,427,
+432,433,434,435,436,437,442,443,444,445,446,447,452,453,454,
+455,456,457,462,463,464,465,466,467,472,473,474,475,476,477,
+481,482,483,484,485,499,501,502,503,504,555,602,603,900,901,
+902,903,904,920,921,922,923,924,925,926,930,931,932,940,941,
+960,961,962,963,964,965,966,967,968,969,970,971,980,981,982,991}
+OTHER=KNOWN-ADC-IP-{555}
+nums=lambda z:','.join(map(str,sorted(z)))
+START='2024-11-07'
+END='2026-10-29'
+params=dict(T=T,B=B,L=L,E=E,H=H,start=START,end=END,
+  adc=nums(ADC),ip=nums(IP),other=nums(OTHER),V=V)
+
+
+import ast
+source=project.get_recipe('compute_results_Corporate_LTV').get_settings().get_code()
+node=next(n for n in ast.parse(source).body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='SQL_TEMPLATE' for t in n.targets))
+sql=ast.literal_eval(node.value)
+new_name='ltv_increase_15pp_12m_above_85'
+old_name='ltv_increase_15pp_12m'
+old_rule="('ltv_increase_15pp_12m',15,12),"
+assert sql.count(old_rule)==1
+sql=sql.replace(old_rule,old_rule+"\n ('"+new_name+"',15,12),",1)
+needle='FROM LTV_FEATURES WHERE LTV_INCREASE_PP>THRESHOLD_A'
+assert sql.count(needle)==1
+sql=sql.replace(needle,needle+" AND (INDICATOR<>'"+new_name+"' OR LTV_VALUE>0.85)",1)
+needle='m.THRESHOLD_A,m.THRESHOLD_B,NULL::DOUBLE THRESHOLD_C,'
+assert sql.count(needle)==1
+sql=sql.replace(needle,"m.THRESHOLD_A,m.THRESHOLD_B,IFF(m.INDICATOR='"+new_name+"',85::DOUBLE,NULL::DOUBLE) THRESHOLD_C,",1)
+needle='FROM METRIC_BASE m ORDER BY'
+assert sql.count(needle)==1
+sql=sql.replace(needle,"FROM METRIC_BASE m WHERE m.INDICATOR IN ('"+old_name+"','"+new_name+"') ORDER BY",1)
+print('START | existing vs proposed LTV 12M rule | READ ONLY',flush=True)
+ltv_85_results=query(snow,sql.format(**params))
+assert len(ltv_85_results)==12 and not ltv_85_results.duplicated(['PORTFOLIO','INDICATOR']).any()
+assert (ltv_85_results.N_TP+ltv_85_results.N_FN).eq(ltv_85_results.N_EVENTS).all()
+assert (ltv_85_results.N_TP_ALERTS+ltv_85_results.N_FP).eq(ltv_85_results.N_EVALUATED_EPISODES).all()
+existing=dataiku.Dataset('results_Corporate_LTV',project_key=PROJECT).get_dataframe()
+existing.columns=existing.columns.str.upper()
+cols=['N_EVENTS','N_TP','N_FP','N_EVALUATED_EPISODES','N_EVENTS_DETECTABLE','MAX_DAILY_ALERTS']
+a=existing.loc[existing.INDICATOR.eq(old_name),['PORTFOLIO']+cols].set_index('PORTFOLIO').sort_index()
+b=ltv_85_results.loc[ltv_85_results.INDICATOR.eq(old_name),['PORTFOLIO']+cols].set_index('PORTFOLIO').sort_index()
+assert a.shape==b.shape and a.index.equals(b.index) and a.astype(float).eq(b.astype(float)).all().all(),'Original 12M rule not reconciled'
+print('PASS | original 12M results reconciled')
+print('\n=== LTV 12M | OLD VS ABOVE 85% ===')
+print(ltv_85_results[['PORTFOLIO','INDICATOR','N_RAW_ENTITIES','N_EVALUATED_EPISODES','N_TP','N_FP','N_ALERTS','ACCURACY','COVERAGE','COVERAGE_2','MAX_DAILY_ALERTS']].sort_values(['PORTFOLIO','INDICATOR']).to_string(index=False))
+print('FINISHED | no datasets changed; historical LTV availability and policy mapping remain unchanged')

@@ -1,0 +1,183 @@
+# Run once after the Combined results dataset has been built.
+# Creates one permanent export recipe and one managed folder.
+import dataiku
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+NAME = 'export_results_Corporate_EWS'
+FOLDER = 'Corporate_EWS_Export'
+FOLDER_CONNECTION = 'filesystem_folders'
+FILE = 'Corporate_EWS_Results.xlsx'
+project = dataiku.api_client().get_project(PROJECT)
+
+sources = [
+    ('DPD', 'results_Corporate_DPD', (30408,)),
+    ('Rating / PD', 'results_Corporate_EWS_validation', (302352,)),
+    ('Payments', 'results_Corporate_Payments', (840,)),
+    ('Forbearance', 'results_Corporate_Forbearance', (120,)),
+    ('Limit utilisation', 'results_Corporate_Limit_Utilisation', (246,)),
+    ('LTV', 'results_Corporate_LTV', (84, 90)),
+    ('GEC contagion', 'results_Corporate_GEC_Contagion', (114,)),
+    ('Recurring payments', 'results_Corporate_Recurring_Payments', (12,)),
+    ('Combined payments and utilisation', 'results_Corporate_Combined_Payments_Utilisation', (12,)),
+]
+known = {d['name'] for d in project.list_datasets()}
+missing = {d for _, d, _ in sources} - known
+if missing:
+    raise RuntimeError('Missing result datasets: ' + str(sorted(missing)))
+systematic = 'results_Corporate_Systematic_Downgrades'
+if systematic in known:
+    sources.append(('Systematic downgrades', systematic, (42,)))
+else:
+    print('OPEN ITEM | Systematic downgrades results not present')
+
+recipe_code = r'''
+import os, re, tempfile, zipfile
+import numpy as np
+import pandas as pd
+import dataiku
+import xlsxwriter
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = __PROJECT__
+SOURCES = __SOURCES__
+FOLDER_ID = __FOLDER_ID__
+FILE = __FILE__
+PORTS = ['GLOBAL','LARGE_CORPORATE','MID_CORPORATE','OTHER_CORPORATE','ADC','IP']
+project = dataiku.api_client().get_project(PROJECT)
+exe = SQLExecutor2(connection='DEV_AA_TEAMS')
+
+def ident(v):
+    v = str(v).replace('${projectKey}', PROJECT)
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_$]*', v):
+        raise ValueError('Invalid SQL identifier: '+v)
+    return '"'+v+'"'
+
+def physical(name):
+    p = project.get_dataset(name).get_settings().get_raw()['params']
+    if p.get('connection') != 'DEV_AA_TEAMS':
+        raise RuntimeError('Unexpected connection: '+name)
+    return ident(p['schema'])+'.'+ident(p['table'])
+
+def query(sql):
+    df = exe.query_to_df(sql)
+    df.columns = df.columns.str.upper()
+    return df
+
+keys = ['PORTFOLIO','INDICATOR','TARGET_SCOPE','THRESHOLD_A','THRESHOLD_B','THRESHOLD_C','THRESHOLD_GEC_EXPOSURE','THRESHOLD_ARREARS']
+metrics = ['N_ENTITIES','N_SOURCE_EVALUATIONS','N_ELIGIBLE_EVALUATIONS','N_EVENTS','N_EVENTS_DETECTABLE','N_TP','N_FP','N_FN','N_ALERTS','N_TP_ALERTS','N_EVALUATED_EPISODES','ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION','AVG_DAILY_ALERTS','MAX_DAILY_ALERTS','MAX_MONTHLY_ALERTS','TOTAL_COST_CF1','TOTAL_COST','RESULT_STATUS','DATA_FREQUENCY','STATUS_DETAILS']
+cols = keys + metrics
+text_cols = {'PORTFOLIO','INDICATOR','TARGET_SCOPE','RESULT_STATUS','DATA_FREQUENCY','STATUS_DETAILS'}
+notes = {
+    'Rating / PD': 'Legacy configurations retained; not all revalidated under current rules.',
+    'Payments': 'Monthly; includes fixed Top N, percentage Top N and account movements.',
+    'Forbearance': 'Preserve stored target definitions.',
+    'Limit utilisation': 'Monthly revolving proxy; daily outstanding methodology pending.',
+    'LTV': 'ADC policy mapping provisional; IPRE policy mapping and historical availability pending.',
+    'GEC contagion': 'Slotting group-head mapping provisional.',
+    'Recurring payments': 'Payer and transfer/disbursement reconciliation pending.',
+    'Combined payments and utilisation': 'Incoming decline >25%; utilisation increase >20% relative or >20pp; latest 12M vs preceding 12M; 12/12 payments, min 11/12 utilisation per window; no imputation; revolving proxy; ADC excluded.',
+    'Systematic downgrades': 'Methodology and results require business review.',
+}
+frames=[]
+for family,name,expected in SOURCES:
+    table=physical(name)
+    available=set(query('SELECT * FROM '+table+' WHERE 1=0').columns)
+    required={'PORTFOLIO','INDICATOR','N_EVENTS','N_TP','N_FP','N_FN','ACCURACY','COVERAGE'}
+    if not required.issubset(available):
+        raise RuntimeError('Missing result columns: '+name+' '+str(required-available))
+    expr=[ident(c) if c in available else ('NULL::VARCHAR' if c in text_cols else 'NULL::DOUBLE')+' AS '+ident(c) for c in cols]
+    where='1=1'
+    if name=='results_Corporate_EWS_validation':
+        where="""LOWER(TRIM(INDICATOR::VARCHAR)) NOT IN ('dpd','dpd x gec_exposure','dpd_arrears','dpd_gec_arrears')
+        AND INDICATOR NOT ILIKE 'payment%' AND INDICATOR NOT ILIKE 'forbearance%'
+        AND UPPER(COALESCE(TARGET_SCOPE::VARCHAR,'RATING')) NOT IN ('DPD_EARLY','DPD_LATE')"""
+    x=query('SELECT '+','.join(expr)+' FROM '+table+' WHERE '+where)
+    if len(x) not in expected or set(x.PORTFOLIO)!=set(PORTS):
+        raise RuntimeError(f'{name}: unexpected result grid ({len(x)} rows); expected {expected} and six portfolios')
+    x['INDICATOR']=x.INDICATOR.astype(str).str.replace('limit_weighted_monthly_proxy_','limit_weighted_monthly_',regex=False)
+    if x.duplicated(keys).any():
+        raise RuntimeError('Duplicate configurations in '+name)
+    if name=='results_Corporate_Combined_Payments_Utilisation':
+        assert set(x.INDICATOR)=={'incoming_payments_limit_utilisation_12m_relative','incoming_payments_limit_utilisation_12m_pp'}
+        assert x.groupby('PORTFOLIO').size().eq(2).all()
+        assert x.loc[x.PORTFOLIO.eq('ADC'),'RESULT_STATUS'].eq('NOT_APPLICABLE').all()
+        assert (x.N_TP+x.N_FN).eq(x.N_EVENTS).all()
+        assert (x.N_TP_ALERTS+x.N_FP).eq(x.N_EVALUATED_EPISODES).all()
+    x.insert(0,'FAMILY',family)
+    x['REVIEW_NOTE']=notes.get(family,'Preserve source methodology and target definitions.')
+    frames.append(x)
+    print('EXPORT SOURCE |',name,'|',len(x),flush=True)
+
+results=pd.concat(frames,ignore_index=True)
+if results.duplicated(keys).any():
+    print(results.loc[results.duplicated(keys,keep=False),['FAMILY']+keys].head(30).to_string(index=False))
+    raise RuntimeError('Overlapping source configurations; reconcile before exporting')
+results['PORTFOLIO']=pd.Categorical(results.PORTFOLIO,categories=PORTS,ordered=True)
+results=results.sort_values(['PORTFOLIO','FAMILY','INDICATOR','TARGET_SCOPE','THRESHOLD_A','THRESHOLD_B','THRESHOLD_C'],kind='stable')
+cat=(results.groupby(['FAMILY','INDICATOR','REVIEW_NOTE'],dropna=False,observed=True)
+     .agg(N_CONFIGURATIONS=('INDICATOR','size'),N_PORTFOLIOS=('PORTFOLIO','nunique')).reset_index())
+pending=pd.DataFrame([
+    ('Covenant breaches','Not backtested; source pending.'),
+    ('Limit utilisation daily','Daily outstanding methodology pending.'),
+    ('Systematic downgrades','Business review pending; included only when result dataset is present.'),
+    ('IPRE LTV policy','Policy mapping incomplete.'),
+    ('LTV historical coverage','Month-end alignment and detailed protection QA pending.'),
+    ('Combined payments and utilisation','Revolving proxy; facility scope and threshold interpretation pending confirmation; no historical imputation.'),
+],columns=['OPEN_ITEM','STATUS'])
+
+with tempfile.TemporaryDirectory() as tmp:
+    path=os.path.join(tmp,FILE)
+    with xlsxwriter.Workbook(path,{'constant_memory':True,'strings_to_formulas':False,'strings_to_urls':False}) as wb:
+        header=wb.add_format({'bold':True,'bg_color':'#183B56','font_color':'#FFFFFF','text_wrap':True,'valign':'vcenter'})
+        pct=wb.add_format({'num_format':'0.00%'})
+        integer=wb.add_format({'num_format':'#,##0'})
+        decimal=wb.add_format({'num_format':'#,##0.00'})
+        percent={'ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION'}
+        def sheet(name,frame):
+            if len(frame)>1048575:
+                raise RuntimeError('Excel row limit exceeded: '+name)
+            ws=wb.add_worksheet(name)
+            ws.freeze_panes(1,2)
+            ws.set_row(0,32)
+            ws.write_row(0,0,list(frame.columns),header)
+            ws.autofilter(0,0,len(frame),len(frame.columns)-1)
+            for j,c in enumerate(frame.columns):
+                ws.set_column(j,j,75 if c in {'INDICATOR','REVIEW_NOTE','STATUS','STATUS_DETAILS'} else 34 if c in {'FAMILY','RESULT_STATUS','OPEN_ITEM'} else 22)
+            for i,row in enumerate(frame.itertuples(index=False,name=None),1):
+                for j,v in enumerate(row):
+                    if pd.isna(v): continue
+                    c=frame.columns[j]
+                    if isinstance(v,(int,float,np.integer,np.floating)):
+                        if np.isfinite(v): ws.write_number(i,j,float(v),pct if c in percent else integer if c.startswith('N_') else decimal)
+                    else: ws.write_string(i,j,str(v))
+        sheet('Results',results)
+        sheet('Indicator Catalogue',cat)
+        sheet('Open Items',pending)
+    with zipfile.ZipFile(path) as z:
+        if z.testzip() is not None: raise RuntimeError('Invalid Excel archive')
+    with open(path,'rb') as f:
+        dataiku.Folder(FOLDER_ID,project_key=PROJECT).upload_stream(FILE,f)
+print('EXPORT COMPLETE |',len(results),'configurations |',results.INDICATOR.nunique(),'indicator names',flush=True)
+'''
+
+# Protect existing objects; create the folder only after all inputs exist.
+if NAME in {r['name'] for r in project.list_recipes()}:
+    raise RuntimeError('Export recipe already exists; run it from Flow. No changes made.')
+if any(f.get('name')==FOLDER for f in project.list_managed_folders()):
+    raise RuntimeError('Export folder already exists; inspect its producer. No changes made.')
+for marker,value in {'__PROJECT__':PROJECT,'__SOURCES__':sources,'__FILE__':FILE}.items():
+    recipe_code=recipe_code.replace(marker,repr(value),1)
+compile(recipe_code.replace('__FOLDER_ID__',repr('TEST')),NAME,'exec')
+folder=project.create_managed_folder(FOLDER,connection_name=FOLDER_CONNECTION)
+recipe_code=recipe_code.replace('__FOLDER_ID__',repr(folder.id),1)
+builder=project.new_recipe('python',NAME)
+for _,name,_ in sources:
+    builder.with_input(name)
+builder.with_existing_output(folder.id)
+builder.with_script(recipe_code)
+created=builder.create()
+print('CREATED |',NAME,'->',FOLDER,'|',folder.id,flush=True)
+# Run only this export recipe, not its upstream calculation recipes.
+job=created.run()
+job.wait_for_completion()
+print('FILES |',folder.list_contents(),flush=True)

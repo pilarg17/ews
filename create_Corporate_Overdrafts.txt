@@ -1,0 +1,358 @@
+# Corporate EWS - repeated overdrafts
+# Paste this entire cell into a Dataiku Python notebook and execute once.
+# Two dedicated recipes; no changes to legacy branches or consolidated export.
+
+FEATURE_CODE = r'''# Technical monthly overdraft recurrence features.
+import re
+import numpy as np
+import pandas as pd
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT = 'VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION = 'DEV_AA_TEAMS'
+SOURCE = 'Overdraft_Excess_s'
+OUTPUT = 'overdraft_features_Corporate'
+TRAINING = 'EWS_training_Corporate'
+# Candidate assumption: the source is an exhaustive extract of qualifying excesses.
+# Absence is zero only within covered months and stable, unambiguous customer mappings.
+MIN_WEEKDAY_COVERAGE = 0.80
+DURATIONS = (5, 10, 15)
+project = dataiku.api_client().get_project(PROJECT)
+snow = SQLExecutor2(connection=CONNECTION)
+ora = SQLExecutor2(connection='PRD_BDWH')
+
+def query(exe, sql):
+    x = exe.query_to_df(sql)
+    x.columns = x.columns.str.upper()
+    return x
+
+def physical(name):
+    p = project.get_dataset(name).get_settings().get_raw()['params']
+    assert p['connection'] == CONNECTION, name
+    def q(v):
+        v = str(v).replace('${projectKey}', PROJECT)
+        assert re.fullmatch(r'[A-Za-z_][A-Za-z_0-9$]*', v), v
+        return '"'+v+'"'
+    return q(p['schema'])+'.'+q(p['table'])
+
+def norm(s):
+    return s.astype('string').str.strip().str.replace(r'^(\d+)\.0+$',r'\1',regex=True).replace('',pd.NA)
+
+def dates(s):
+    return pd.to_datetime(s, errors='coerce', utc=True).dt.tz_localize(None).dt.normalize()
+
+def fmt(d): return pd.Timestamp(d).strftime('%Y-%m-%d')
+
+def write_blocked(reason):
+    # Explicit non-observation; never joins the backtest.
+    x = pd.DataFrame({'ENTITY_ID':['__NO_OBSERVATION__'], 'MONTH':[pd.Timestamp('1900-01-01')],
+                      'AS_OF_DATE':[pd.Timestamp('1900-01-01')], 'THRESHOLD_A':[5],
+                      'N_LATEST_12M':[0], 'N_PREVIOUS_12M':[0], 'DELTA_EPISODES':[0],
+                      'PREV_DELTA_EPISODES':[0], 'VALID':[0], 'FEATURE_STATUS':[reason]})
+    dataiku.Dataset(OUTPUT,project_key=PROJECT).write_with_schema(x)
+    print('BLOCKED |',reason,flush=True)
+
+def main():
+    cols=['ACCOUNT_ID','ACCOUNT_SUBTYPE','PAST_DUE_AMOUNT_CTV','DAYS_PAST_DUE','CUSTOMER','MAP_DTE']
+    ds=dataiku.Dataset(SOURCE,project_key=PROJECT)
+    actual={c['name'].upper():c['name'] for c in ds.read_schema()}
+    assert set(cols)<=set(actual), 'Missing source columns: '+str(set(cols)-set(actual))
+    p=project.get_dataset(SOURCE).get_settings().get_raw().get('params',{})
+    if p.get('connection')==CONNECTION:
+        qcols=','.join('"'+actual[c]+'"' for c in cols)
+        # Prefix account/customer strings to prevent SQL driver numeric inference.
+        qcols=','.join(("'K|'||TRIM(TO_VARCHAR(\""+actual[c]+"\")) AS "+c) if c in ('ACCOUNT_ID','CUSTOMER') else '"'+actual[c]+'" AS '+c for c in cols)
+        x=query(snow,'SELECT DISTINCT '+qcols+' FROM '+physical(SOURCE))
+        for c in ('ACCOUNT_ID','CUSTOMER'): x[c]=x[c].astype('string').str.slice(2)
+    else:
+        x=ds.get_dataframe(columns=[actual[c] for c in cols],infer_with_pandas=False)
+        x.columns=x.columns.str.upper()
+    if x.empty: return write_blocked('EMPTY_SOURCE')
+    raw=len(x)
+    for c in ['ACCOUNT_ID','CUSTOMER']: x[c]=norm(x[c])
+    x['MAP_DTE']=dates(x.MAP_DTE)
+    x['DAYS_PAST_DUE']=pd.to_numeric(x.DAYS_PAST_DUE,errors='coerce')
+    x['PAST_DUE_AMOUNT_CTV']=pd.to_numeric(x.PAST_DUE_AMOUNT_CTV,errors='coerce')
+    print('SOURCE QA | rows',raw,'| subtypes',x.ACCOUNT_SUBTYPE.nunique(),flush=True)
+    print(x.groupby('ACCOUNT_SUBTYPE',dropna=False).agg(N_ROWS=('ACCOUNT_ID','size'),N_ACCOUNTS=('ACCOUNT_ID','nunique'),N_CUSTOMERS=('CUSTOMER','nunique')).to_string(),flush=True)
+    invalid=x[['ACCOUNT_ID','CUSTOMER','MAP_DTE','DAYS_PAST_DUE']].isna().any(axis=1)|x.DAYS_PAST_DUE.lt(0)|x.DAYS_PAST_DUE.mod(1).ne(0)|x.DAYS_PAST_DUE.gt(36500)
+    if invalid.any(): return write_blocked('INVALID_ACCOUNT_CUSTOMER_DATE_OR_DPD')
+    # Identical observations may repeat. Conflicting account-day DPD/owner is not resolved arbitrarily.
+    x=x[['ACCOUNT_ID','CUSTOMER','MAP_DTE','DAYS_PAST_DUE']].drop_duplicates()
+    if x.duplicated(['ACCOUNT_ID','MAP_DTE']).any():
+        print('CONFLICTING ACCOUNT-DAYS',int(x.duplicated(['ACCOUNT_ID','MAP_DTE'],keep=False).sum()),flush=True)
+        return write_blocked('CONFLICTING_ACCOUNT_DAY')
+    x['MONTH']=x.MAP_DTE.dt.to_period('M').dt.to_timestamp()
+    lo=x.MAP_DTE.min(); hi=x.MAP_DTE.max()
+    t=physical(TRAINING)
+    bounds=query(snow,'SELECT MIN(TO_DATE(MAP_DTE)) START_DATE,MAX(TO_DATE(MAP_DTE)) END_DATE FROM '+t)
+    train_end=pd.Timestamp(bounds.END_DATE.iloc[0]).normalize().tz_localize(None)
+    # Drop partial boundary months. First/last weekday proxy is a conservative completeness check.
+    months=pd.date_range(lo.to_period('M').start_time,min(hi,train_end).to_period('M').start_time,freq='MS',name='MONTH')
+    observed=x[['MAP_DTE','MONTH']].drop_duplicates()
+    covered=[]
+    for m in months:
+        end=m+pd.offsets.MonthEnd(0)
+        weekdays=pd.bdate_range(m,end)
+        seen=set(observed.loc[observed.MONTH.eq(m),'MAP_DTE'])
+        n=sum(d in seen for d in weekdays)
+        good=bool(lo<=weekdays[0] and hi>=weekdays[-1] and end<train_end and n/len(weekdays)>=MIN_WEEKDAY_COVERAGE)
+        covered.append(good)
+        print('MONTH COVERAGE |',fmt(m),'| dates',len(seen),'| weekdays',n,'/',len(weekdays),'| candidate complete',good,flush=True)
+    coverage=pd.Series(covered,index=months,dtype=bool)
+    # A crossing needs 24 complete months plus the immediately preceding state.
+    if len(months)<25 or not coverage.astype(int).rolling(25).sum().eq(25).any():
+        return write_blocked('INSUFFICIENT_25_CONSECUTIVE_MONTHS')
+    # Independent account episodes: a falling DPD, zero, or implied new start
+    # after the preceding observation indicates a reset. Missing rows alone do not.
+    x=x.sort_values(['ACCOUNT_ID','MAP_DTE']).reset_index(drop=True)
+    g=x.groupby('ACCOUNT_ID',sort=False)
+    prev_dpd=g.DAYS_PAST_DUE.shift(); prev_date=g.MAP_DTE.shift()
+    inferred=x.MAP_DTE-pd.to_timedelta(x.DAYS_PAST_DUE.clip(lower=1)-1,unit='D')
+    new=(prev_date.isna()|prev_dpd.eq(0)|x.DAYS_PAST_DUE.lt(prev_dpd)|inferred.gt(prev_date)) & x.DAYS_PAST_DUE.gt(0)
+    x['EPISODE']=new.groupby(x.ACCOUNT_ID).cumsum().astype('int64')
+    x['START_ESTIMATE']=inferred
+    positive=x[x.DAYS_PAST_DUE.gt(0)].copy()
+    # At first observation of each episode, record whether its start predates the extract.
+    first=positive.drop_duplicates(['ACCOUNT_ID','EPISODE'])[['ACCOUNT_ID','EPISODE','START_ESTIMATE']].rename(columns={'START_ESTIMATE':'FIRST_START_ESTIMATE'})
+    positive=positive.merge(first,on=['ACCOUNT_ID','EPISODE'],how='left',validate='many_to_one')
+    positive=positive[positive.FIRST_START_ESTIMATE.ge(lo)]
+    events=[]
+    for d in DURATIONS:
+        a=positive[positive.DAYS_PAST_DUE.gt(d)].drop_duplicates(['ACCOUNT_ID','EPISODE'],keep='first').copy()
+        a['THRESHOLD_A']=d
+        events.append(a[['ACCOUNT_ID','CUSTOMER','MONTH','MAP_DTE','THRESHOLD_A']])
+    events=pd.concat(events,ignore_index=True)
+    print('EPISODES | first observed qualification by DPD',events.groupby('THRESHOLD_A').size().to_dict(),flush=True)
+    # All Corporate entities in the training population; not only customers with observed excesses.
+    universe=query(snow,"SELECT DISTINCT 'E|'||TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_KEY FROM "+t+" WHERE ENTITY_ID IS NOT NULL")
+    corporate=set(norm(universe.ENTITY_KEY.astype('string').str.slice(2)).dropna())
+    # Use a unique customer-to-entity mapping from the latest source snapshot in each month.
+    # At the evaluation date (next month), the mapping snapshot is already in the past.
+    parts=[]; counts=[]
+    for m in months:
+        if not coverage.loc[m]: continue
+        end=m+pd.offsets.MonthBegin(1)
+        sql=f"""WITH S AS (
+          SELECT MAX(MAP_DTE) D FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_CUSTOMER_MON_VW
+          WHERE MAP_DTE>=DATE '{fmt(m)}' AND MAP_DTE<DATE '{fmt(end)}'
+        ) SELECT DISTINCT 'E|'||TRIM(TO_CHAR(A.ENTITY_ID)) ENTITY_KEY,
+          'C|'||TRIM(TO_CHAR(A.CUSTOMER_ID)) CUSTOMER_KEY
+        FROM BDL_CREDIT_INSIGHT_PLY.ENTITY_CUSTOMER_MON_VW A JOIN S ON A.MAP_DTE=S.D
+        WHERE A.ENTITY_ID IS NOT NULL AND A.CUSTOMER_ID IS NOT NULL"""
+        mp=query(ora,sql)
+        if mp.empty:
+            print('MAPPING | missing month',fmt(m),flush=True);continue
+        mp['ENTITY_ID']=norm(mp.ENTITY_KEY.astype('string').str.slice(2))
+        mp['CUSTOMER']=norm(mp.CUSTOMER_KEY.astype('string').str.slice(2))
+        mp=mp[['ENTITY_ID','CUSTOMER']].dropna().drop_duplicates()
+        amb=mp.CUSTOMER.duplicated(keep=False)
+        bad_entities=set(mp.loc[amb,'ENTITY_ID'])
+        mp=mp.loc[~amb & mp.ENTITY_ID.isin(corporate) & ~mp.ENTITY_ID.isin(bad_entities)].copy()
+        if mp.empty: continue
+        # Stable mapped customer set required throughout both windows and previous state.
+        sets=mp.groupby('ENTITY_ID').CUSTOMER.agg(lambda s:'|'.join(sorted(s))).rename('CUSTOMER_SET').reset_index()
+        sets['MONTH']=m;parts.append(sets)
+        a=events.loc[events.MONTH.eq(m)].merge(mp,on='CUSTOMER',how='left',validate='many_to_one')
+        print('MAPPING |',fmt(m),'| entities',len(sets),'| event rows',len(a),'| mapped to Corporate',int(a.ENTITY_ID.notna().sum()),'| ambiguous customer rows',int(amb.sum()),flush=True)
+        # Count independent account episodes, including multiple accounts of one entity.
+        b=a.dropna(subset=['ENTITY_ID']).groupby(['ENTITY_ID','THRESHOLD_A']).size().rename('N_EPISODES').reset_index()
+        b['MONTH']=m;counts.append(b)
+    if not parts: return write_blocked('NO_CUSTOMER_ENTITY_MAPPING')
+    p=pd.concat(parts,ignore_index=True)
+    w=p.pivot(index='ENTITY_ID',columns='MONTH',values='CUSTOMER_SET').reindex(columns=months)
+    # Equal consecutive customer sets; missing mapping invalidates the calendar window.
+    stable=(w.notna() & w.eq(w.shift(1,axis=1))).fillna(False)
+    valid25=stable.T.astype('int8').rolling(24,min_periods=24).sum().T.eq(24)
+    if not valid25.any().any(): return write_blocked('NO_STABLE_25_MONTH_ENTITY_HISTORY')
+    c=pd.concat(counts,ignore_index=True) if counts else pd.DataFrame(columns=['ENTITY_ID','THRESHOLD_A','MONTH','N_EPISODES'])
+    out=[]
+    for d in DURATIONS:
+        z=c.loc[c.THRESHOLD_A.eq(d)]
+        n=z.pivot(index='ENTITY_ID',columns='MONTH',values='N_EPISODES').reindex(index=w.index,columns=months).fillna(0).where(w.notna())
+        latest=n.T.rolling(12,min_periods=12).sum().T; previous=latest.shift(12,axis=1)
+        delta=latest-previous; prev_delta=delta.shift(1,axis=1)
+        ok=valid25 & delta.notna() & prev_delta.notna()
+        long=delta.where(ok).stack().rename('DELTA_EPISODES').reset_index()
+        if long.empty: continue
+        for name,mat in [('N_LATEST_12M',latest),('N_PREVIOUS_12M',previous),('PREV_DELTA_EPISODES',prev_delta)]:
+            v=mat.where(ok).stack().rename(name).reset_index()
+            long=long.merge(v,on=['ENTITY_ID','MONTH'],validate='one_to_one')
+        long['AS_OF_DATE']=long.MONTH+pd.offsets.MonthBegin(1)
+        long['THRESHOLD_A']=d;long['VALID']=1
+        long['FEATURE_STATUS']='CANDIDATE_FILTERED_SOURCE'
+        for col in ['DELTA_EPISODES','N_LATEST_12M','N_PREVIOUS_12M','PREV_DELTA_EPISODES']: long[col]=long[col].astype('int64')
+        out.append(long)
+    if not out: return write_blocked('NO_VALID_CONSECUTIVE_WINDOWS')
+    f=pd.concat(out,ignore_index=True)
+    assert not f.duplicated(['ENTITY_ID','MONTH','THRESHOLD_A']).any()
+    assert f.DELTA_EPISODES.eq(f.N_LATEST_12M-f.N_PREVIOUS_12M).all()
+    assert f.N_LATEST_12M.ge(0).all() and f.N_PREVIOUS_12M.ge(0).all()
+    f['ENTITY_ID']=f.ENTITY_ID.astype(str)
+    print('FEATURE QA |',len(f),'rows',f.ENTITY_ID.nunique(),'entities',flush=True)
+    print(f.groupby(['MONTH','THRESHOLD_A']).agg(N_EVALUATIONS=('ENTITY_ID','size'),N_POSITIVE_DELTA=('DELTA_EPISODES',lambda s:int(s.gt(0).sum())),MAX_DELTA=('DELTA_EPISODES','max')).to_string(),flush=True)
+    dataiku.Dataset(OUTPUT,project_key=PROJECT).write_with_schema(f)
+    print('FINISHED |',OUTPUT,flush=True)
+
+main()
+'''
+
+RESULT_CODE = r'''# Corporate EWS - repeated overdrafts backtest.
+import re
+import numpy as np
+import pandas as pd
+import dataiku
+from dataiku.core.sql import SQLExecutor2
+
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION='DEV_AA_TEAMS'
+OUTPUT='results_Corporate_Overdrafts'
+FEATURES='overdraft_features_Corporate'
+project=dataiku.api_client().get_project(PROJECT)
+exe=SQLExecutor2(connection=CONNECTION)
+
+def physical(name):
+    p=project.get_dataset(name).get_settings().get_raw()['params']
+    assert p['connection']==CONNECTION, name
+    def q(v):
+        v=str(v).replace('${projectKey}',PROJECT)
+        assert re.fullmatch(r'[A-Za-z_][A-Za-z_0-9$]*',v),v
+        return '"'+v+'"'
+    return q(p['schema'])+'.'+q(p['table'])
+
+def query(sql):
+    x=exe.query_to_df(sql)
+    x.columns=x.columns.str.upper()
+    return x
+
+ADC=set(range(401,408))|set(range(412,418))|set(range(422,428))|set(range(432,438))|set(range(442,448))|{499,961,962,963,964,965,970}
+IP=set(range(452,458))|set(range(462,468))|set(range(472,478))|{966,967,968,971}
+KNOWN={11,12,14,15,16,17,21,41,42,43,44,45,46,47,101,111,112,113,114,115,116,117,118,119,120,121,123,126,127,128,130,140,201,211,214,215,216,301,311,321,331,341,351,361,362,401,402,403,404,405,406,407,412,413,414,415,416,417,422,423,424,425,426,427,432,433,434,435,436,437,442,443,444,445,446,447,452,453,454,455,456,457,462,463,464,465,466,467,472,473,474,475,476,477,481,482,483,484,485,499,501,502,503,504,555,602,603,900,901,902,903,904,920,921,922,923,924,925,926,930,931,932,940,941,960,961,962,963,964,965,966,967,968,969,970,971,980,981,982,991}
+nums=lambda z:','.join(map(str,sorted(z)))
+T=physical('EWS_training_Corporate')
+B=physical('EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02')
+L=physical('vars_loan_level')
+E=physical('vars_entity_level_merged')
+H=physical('vars_entity_level')
+F=physical(FEATURES)
+O=physical(OUTPUT)
+assert O.upper() not in {x.upper() for x in [T,B,L,E,H,F]}
+bounds=query('SELECT MIN(TO_DATE(MAP_DTE)) START_DATE,MAX(TO_DATE(MAP_DTE)) END_DATE FROM '+T)
+start=pd.Timestamp(bounds.START_DATE.iloc[0]).strftime('%Y-%m-%d')
+end=pd.Timestamp(bounds.END_DATE.iloc[0]).strftime('%Y-%m-%d')
+print('BACKTEST |',start,end,flush=True)
+items=[(f'repeated_overdrafts_{d}dpd_12m',d,k) for d in (5,10,15) for k in (1,2,3,4,5)]
+values=','.join(f"('{i}',{a},{b})" for i,a,b in items)
+SQL_TEMPLATE = "\nWITH SEG_RAW AS (\n SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE,\n        COUNT(*) N_ROWS,COUNT(DISTINCT UPPER(TRIM(TO_VARCHAR(CORPORATE_SEGMENT)))) N_SEG,\n        MIN(UPPER(TRIM(TO_VARCHAR(CORPORATE_SEGMENT)))) SEGMENT\n FROM {E} WHERE ENTITY_ID IS NOT NULL AND MAP_DTE IS NOT NULL\n GROUP BY 1,2\n),\nSEG_EXACT AS (SELECT ENTITY_ID,MAP_DTE,SEGMENT FROM SEG_RAW WHERE N_ROWS=1 AND N_SEG=1),\nNEED_HIST AS (\n SELECT DISTINCT TRIM(TO_VARCHAR(t.ENTITY_ID)) ENTITY_ID,TO_DATE(t.MAP_DTE) MAP_DTE\n FROM {T} t LEFT JOIN SEG_EXACT e ON e.ENTITY_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))\n  AND e.MAP_DTE=TO_DATE(t.MAP_DTE)\n WHERE e.ENTITY_ID IS NULL AND TO_DATE(t.MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}'\n),\nSEG_HISTORY AS (\n SELECT n.ENTITY_ID,n.MAP_DTE,COUNT(h.ENTITY_ID) N_MATCH,\n        COUNT(DISTINCT UPPER(TRIM(TO_VARCHAR(h.CORPORATE_SEGMENT)))) N_SEG,\n        MIN(UPPER(TRIM(TO_VARCHAR(h.CORPORATE_SEGMENT)))) SEGMENT\n FROM NEED_HIST n LEFT JOIN {H} h ON n.ENTITY_ID=TRIM(TO_VARCHAR(h.ENTITY_ID))\n  AND n.MAP_DTE BETWEEN TO_DATE(h.TEK_STRT_DTE)\n                    AND COALESCE(TO_DATE(h.TEK_END_DTE),DATE '9999-12-31')\n GROUP BY 1,2\n),\nSEG AS (\n SELECT ENTITY_ID,MAP_DTE,SEGMENT FROM SEG_EXACT\n UNION ALL\n SELECT ENTITY_ID,MAP_DTE,SEGMENT FROM SEG_HISTORY WHERE N_MATCH=1 AND N_SEG=1\n),\nENTITY_BASE AS (\n SELECT TRIM(TO_VARCHAR(t.ENTITY_ID)) ENTITY_ID,TO_DATE(t.MAP_DTE) MAP_DTE,\n        seg.SEGMENT,\n        TRY_TO_NUMBER(t.TGT_ANY_SAMEDAY::VARCHAR) TARGET,\n        IFF(TRY_TO_NUMBER(b.LOAN_COUNT::VARCHAR)>0 AND\n            TRY_TO_NUMBER(b.LOAN_SOURCE_DUPLICATES::VARCHAR)=0 AND\n            TRY_TO_NUMBER(b.NOMINAL_KNOWN_LOANS::VARCHAR)=TRY_TO_NUMBER(b.LOAN_COUNT::VARCHAR),\n            TRY_TO_DOUBLE(b.NOMINAL_KNOWN_SUM::VARCHAR),NULL) EVENT_NOMINAL\n FROM {T} t JOIN {B} b ON TRIM(TO_VARCHAR(t.ENTITY_ID))=TRIM(TO_VARCHAR(b.ENTITY_ID))\n    AND TO_DATE(t.MAP_DTE)=TO_DATE(b.MAP_DTE)\n LEFT JOIN SEG seg ON seg.ENTITY_ID=TRIM(TO_VARCHAR(t.ENTITY_ID))\n    AND seg.MAP_DTE=TO_DATE(t.MAP_DTE)\n WHERE TO_DATE(t.MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}'\n    AND TRY_TO_NUMBER(b.LOAN_COUNT::VARCHAR)>0\n    AND TRY_TO_NUMBER(b.HAS_VALID_ENTITY_HISTORY::VARCHAR)=1\n QUALIFY ROW_NUMBER() OVER (PARTITION BY t.ENTITY_ID,t.MAP_DTE\n                            ORDER BY b.MAP_DTE)=1\n),\nLOAN_CLASS AS (\n SELECT TRIM(TO_VARCHAR(ENTITY_ID)) ENTITY_ID,TO_DATE(MAP_DTE) MAP_DTE,\n        TRIM(TO_VARCHAR(INSTRUMENT_ID)) INSTRUMENT_ID,\n        MIN(TRY_TO_NUMBER(CONTRACT_INTERNAL_PURPOSE_CODE::VARCHAR)) PURPOSE,\n        COUNT(DISTINCT TRY_TO_NUMBER(CONTRACT_INTERNAL_PURPOSE_CODE::VARCHAR)) N_PURPOSE,\n        COUNT(*) N_ROWS\n FROM {L}\n WHERE TO_DATE(MAP_DTE) BETWEEN DATE '{start}' AND DATE '{end}'\n GROUP BY 1,2,3\n),\nLOAN_SEG AS (\n SELECT ENTITY_ID,MAP_DTE,INSTRUMENT_ID,\n        CASE WHEN PURPOSE IN ({adc}) THEN 'ADC'\n             WHEN PURPOSE IN ({ip}) THEN 'IP'\n             WHEN PURPOSE IN ({other}) THEN 'OTHER_CORPORATE'\n             ELSE NULL END PORTFOLIO\n FROM LOAN_CLASS WHERE N_PURPOSE=1 AND N_ROWS=1\n),\nSCOPE_RAW AS (\n SELECT 'GLOBAL' PORTFOLIO,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL\n FROM ENTITY_BASE p\n UNION ALL\n SELECT p.SEGMENT,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL\n FROM ENTITY_BASE p WHERE p.SEGMENT IN ('LARGE_CORPORATE','MID_CORPORATE')\n UNION ALL\n SELECT ls.PORTFOLIO,p.ENTITY_ID,p.MAP_DTE,p.TARGET,p.EVENT_NOMINAL\n FROM ENTITY_BASE p JOIN LOAN_SEG ls ON p.ENTITY_ID=ls.ENTITY_ID AND p.MAP_DTE=ls.MAP_DTE\n WHERE p.SEGMENT='OTHER_CORPORATE' AND ls.PORTFOLIO IS NOT NULL\n),\nSCOPE AS (\n SELECT PORTFOLIO,ENTITY_ID,MAP_DTE,MAX(TARGET) TARGET,\n        MAX(EVENT_NOMINAL) EVENT_NOMINAL\n FROM SCOPE_RAW GROUP BY 1,2,3\n HAVING COUNT(DISTINCT COALESCE(TARGET,-1))=1\n    AND COUNT(DISTINCT COALESCE(EVENT_NOMINAL,-1))=1\n),\nPORTS AS (\n SELECT COLUMN1::VARCHAR PORTFOLIO FROM VALUES\n ('GLOBAL'),('LARGE_CORPORATE'),('MID_CORPORATE'),('ADC'),('IP'),('OTHER_CORPORATE')\n),\nEVENT_FIRST AS (\n SELECT PORTFOLIO,ENTITY_ID,MIN(MAP_DTE) FIRST_OBS\n FROM SCOPE GROUP BY 1,2\n),\nEVENT_ACTIVE AS (\n SELECT p.*,LAG(MAP_DTE) OVER(PARTITION BY PORTFOLIO,ENTITY_ID ORDER BY MAP_DTE) PREV_ACTIVE\n FROM SCOPE p WHERE TARGET=1\n),\nEVENT_GROUP AS (\n SELECT a.*,SUM(IFF(PREV_ACTIVE IS NULL OR MAP_DTE>DATEADD('MONTH',3,PREV_ACTIVE),1,0))\n         OVER(PARTITION BY PORTFOLIO,ENTITY_ID ORDER BY MAP_DTE ROWS UNBOUNDED PRECEDING) EVENT_GRP\n FROM EVENT_ACTIVE a\n),\nEVENT_START AS (\n SELECT PORTFOLIO,ENTITY_ID,MIN(MAP_DTE) EVENT_DATE\n FROM EVENT_GROUP GROUP BY 1,2,EVENT_GRP\n),\nEVENT_CANDIDATES AS (\n SELECT ev.PORTFOLIO,ev.ENTITY_ID,ev.EVENT_DATE,\n        ev.PORTFOLIO||'|'||ev.ENTITY_ID||'|'||TO_VARCHAR(ev.EVENT_DATE) EVENT_ID,\n        p.EVENT_NOMINAL\n FROM EVENT_START ev JOIN SCOPE p ON p.PORTFOLIO=ev.PORTFOLIO\n    AND p.ENTITY_ID=ev.ENTITY_ID AND p.MAP_DTE=ev.EVENT_DATE\n JOIN EVENT_FIRST f ON f.PORTFOLIO=ev.PORTFOLIO AND f.ENTITY_ID=ev.ENTITY_ID\n WHERE ev.EVENT_DATE>=DATEADD('MONTH',11,f.FIRST_OBS)\n   AND p.EVENT_NOMINAL>=50000\n),\nEVENTS AS (\n SELECT e.* FROM EVENT_CANDIDATES e\n WHERE EXISTS (SELECT 1 FROM SCOPE p WHERE p.PORTFOLIO=e.PORTFOLIO\n  AND p.ENTITY_ID=e.ENTITY_ID\n  AND p.MAP_DTE BETWEEN DATEADD('MONTH',-11,e.EVENT_DATE)\n                    AND DATEADD('MONTH',-1,e.EVENT_DATE)\n  AND p.TARGET=0 AND p.EVENT_NOMINAL>=50000)\n),\nGRID_RULES AS (\n SELECT COLUMN1::VARCHAR INDICATOR,COLUMN2::DOUBLE THRESHOLD_A,COLUMN3::DOUBLE THRESHOLD_B FROM VALUES {values}\n),\nRULE_OBS AS (\n SELECT TRIM(TO_VARCHAR(f.ENTITY_ID)) ENTITY_ID,TO_DATE(f.AS_OF_DATE) AS_OF_DATE,\n g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B,\n IFF(f.DELTA_EPISODES>=g.THRESHOLD_B AND f.PREV_DELTA_EPISODES<g.THRESHOLD_B,1,0) HIT\n FROM {F} f JOIN GRID_RULES g ON f.THRESHOLD_A=g.THRESHOLD_A\n WHERE f.VALID=1 AND TO_DATE(f.AS_OF_DATE) BETWEEN DATE '{start}' AND DATE '{end}'\n),\nMAPPED AS (\n SELECT p.PORTFOLIO,r.ENTITY_ID,p.MAP_DTE SIGNAL_DATE,r.INDICATOR,r.THRESHOLD_A,r.THRESHOLD_B,r.HIT\n FROM RULE_OBS r JOIN SCOPE p ON p.ENTITY_ID=r.ENTITY_ID\n AND p.MAP_DTE BETWEEN r.AS_OF_DATE AND DATEADD('DAY',35,r.AS_OF_DATE)\n QUALIFY ROW_NUMBER() OVER(PARTITION BY p.PORTFOLIO,r.ENTITY_ID,r.AS_OF_DATE,r.INDICATOR,r.THRESHOLD_A,r.THRESHOLD_B ORDER BY p.MAP_DTE)=1\n),\nRAW_SIGNALS AS (\n SELECT DISTINCT PORTFOLIO,ENTITY_ID,SIGNAL_DATE,INDICATOR,THRESHOLD_A,THRESHOLD_B FROM MAPPED WHERE HIT=1\n),\nSOURCE_AVAIL AS (\n SELECT DISTINCT PORTFOLIO,ENTITY_ID,SIGNAL_DATE,INDICATOR,THRESHOLD_A FROM MAPPED\n),\nRAW_QA AS (\n SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,\n        COUNT(*) N_RAW_EPISODES,COUNT(DISTINCT ENTITY_ID) N_RAW_ENTITIES\n FROM RAW_SIGNALS GROUP BY 1,2,3,4\n),\nSIGNAL_VALID AS (\n SELECT DISTINCT s.PORTFOLIO,s.ENTITY_ID,s.SIGNAL_DATE,\n        s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B\n FROM RAW_SIGNALS s JOIN SCOPE p ON s.PORTFOLIO=p.PORTFOLIO\n   AND s.ENTITY_ID=p.ENTITY_ID AND s.SIGNAL_DATE=p.MAP_DTE\n WHERE p.TARGET=0 AND p.EVENT_NOMINAL>=50000\n   AND s.SIGNAL_DATE<=DATEADD('MONTH',-1,DATE '{end}')\n),\nSIGNAL_PREVIOUS AS (\n SELECT s.*,LAG(SIGNAL_DATE) OVER(PARTITION BY PORTFOLIO,ENTITY_ID,INDICATOR,\n        THRESHOLD_A,THRESHOLD_B ORDER BY SIGNAL_DATE) PREV_START\n FROM SIGNAL_VALID s\n),\nSIGNAL_GROUPS AS (\n SELECT s.*,SUM(IFF(PREV_START IS NULL OR SIGNAL_DATE>DATEADD('MONTH',2,PREV_START),1,0))\n      OVER(PARTITION BY PORTFOLIO,ENTITY_ID,INDICATOR,THRESHOLD_A,THRESHOLD_B\n      ORDER BY SIGNAL_DATE ROWS UNBOUNDED PRECEDING) SIGNAL_GROUP\n FROM SIGNAL_PREVIOUS s\n),\nSIGNALS AS (\n SELECT PORTFOLIO,ENTITY_ID,MIN(SIGNAL_DATE) SIGNAL_DATE,\n        INDICATOR,THRESHOLD_A,THRESHOLD_B\n FROM SIGNAL_GROUPS\n GROUP BY PORTFOLIO,ENTITY_ID,INDICATOR,THRESHOLD_A,THRESHOLD_B,SIGNAL_GROUP\n),\nMATCHES AS (\n SELECT s.*,e.EVENT_ID,e.EVENT_DATE,e.EVENT_NOMINAL,\n        DATEDIFF('DAY',s.SIGNAL_DATE,e.EVENT_DATE)/(365.25/12.0) LEAD_MONTHS\n FROM SIGNALS s JOIN EVENTS e ON s.PORTFOLIO=e.PORTFOLIO AND s.ENTITY_ID=e.ENTITY_ID\n WHERE s.SIGNAL_DATE BETWEEN DATEADD('MONTH',-11,e.EVENT_DATE)\n                        AND DATEADD('MONTH',-1,e.EVENT_DATE)\n),\nTP_FIRST AS (\n SELECT m.* FROM MATCHES m\n QUALIFY ROW_NUMBER() OVER (PARTITION BY PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,EVENT_ID\n ORDER BY SIGNAL_DATE)=1\n),\nTP AS (\n SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,\n        COUNT(*) N_TP,SUM(EVENT_NOMINAL) SUM_NOMINAL_TP,\n        SUM(EVENT_NOMINAL*(0.40*(1.0-0.50*(LEAST(11,GREATEST(1,LEAD_MONTHS))-1)/10.0))) SUM_TP_COST\n FROM TP_FIRST GROUP BY 1,2,3,4\n),\nSIGNAL_MATCHED AS (\n SELECT DISTINCT PORTFOLIO,ENTITY_ID,SIGNAL_DATE,INDICATOR,THRESHOLD_A,THRESHOLD_B\n FROM MATCHES\n),\nSIGNAL_CLASS AS (\n SELECT s.PORTFOLIO,s.INDICATOR,s.THRESHOLD_A,s.THRESHOLD_B,\n        COUNT(*) N_EVALUATED_EPISODES,\n        COUNT_IF(m.ENTITY_ID IS NOT NULL) N_TP_ALERTS,\n        COUNT_IF(m.ENTITY_ID IS NULL) N_FP\n FROM SIGNALS s LEFT JOIN SIGNAL_MATCHED m\n ON s.PORTFOLIO=m.PORTFOLIO AND s.ENTITY_ID=m.ENTITY_ID\n AND s.SIGNAL_DATE=m.SIGNAL_DATE AND s.INDICATOR=m.INDICATOR\n AND s.THRESHOLD_A=m.THRESHOLD_A AND s.THRESHOLD_B=m.THRESHOLD_B\n GROUP BY 1,2,3,4\n),\nEVENT_TOTAL AS (\n SELECT PORTFOLIO,COUNT(*) N_EVENTS,SUM(EVENT_NOMINAL) SUM_EVENT_NOMINAL\n FROM EVENTS GROUP BY 1\n),\nEVENT_DETECTABLE AS (\n SELECT e.PORTFOLIO,s.INDICATOR,s.THRESHOLD_A,COUNT(DISTINCT e.EVENT_ID) N_EVENTS_DETECTABLE\n FROM EVENTS e JOIN SOURCE_AVAIL s ON e.PORTFOLIO=s.PORTFOLIO AND e.ENTITY_ID=s.ENTITY_ID\n JOIN SCOPE ep ON ep.PORTFOLIO=s.PORTFOLIO AND ep.ENTITY_ID=s.ENTITY_ID\n   AND ep.MAP_DTE=s.SIGNAL_DATE AND ep.TARGET=0 AND ep.EVENT_NOMINAL>=50000\n AND s.SIGNAL_DATE BETWEEN DATEADD('MONTH',-11,e.EVENT_DATE)\n                        AND DATEADD('MONTH',-1,e.EVENT_DATE)\n GROUP BY 1,2,3\n),\nALERT_DAY AS (\n SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,SIGNAL_DATE,\n        COUNT(DISTINCT ENTITY_ID) N_DAILY_ALERTS\n FROM SIGNALS GROUP BY 1,2,3,4,5\n),\nALERT_MAX AS (\n SELECT PORTFOLIO,INDICATOR,THRESHOLD_A,THRESHOLD_B,\n        MAX(N_DAILY_ALERTS) MAX_DAILY_ALERTS\n FROM ALERT_DAY GROUP BY 1,2,3,4\n),\nEVAL_DAYS AS (\n SELECT a.PORTFOLIO,a.INDICATOR,a.THRESHOLD_A,\n COUNT(*) N_SOURCE_EVALUATIONS,\n COUNT_IF(p.TARGET=0 AND p.EVENT_NOMINAL>=50000 AND a.SIGNAL_DATE<=DATEADD('MONTH',-1,DATE '{end}')) N_ELIGIBLE_EVALUATIONS,\n COUNT(DISTINCT IFF(p.TARGET=0 AND p.EVENT_NOMINAL>=50000 AND a.SIGNAL_DATE<=DATEADD('MONTH',-1,DATE '{end}'),a.SIGNAL_DATE,NULL)) N_EVALUATION_DAYS\n FROM SOURCE_AVAIL a JOIN SCOPE p ON p.PORTFOLIO=a.PORTFOLIO AND p.ENTITY_ID=a.ENTITY_ID AND p.MAP_DTE=a.SIGNAL_DATE GROUP BY 1,2,3\n),\nGRID AS (\n SELECT p.PORTFOLIO,g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B FROM PORTS p\n CROSS JOIN GRID_RULES g\n),\nMETRIC_BASE AS (\n SELECT g.PORTFOLIO,g.INDICATOR,g.THRESHOLD_A,g.THRESHOLD_B,\n        COALESCE(et.N_EVENTS,0) N_EVENTS,COALESCE(tp.N_TP,0) N_TP,\n        COALESCE(sc.N_FP,0) N_FP,COALESCE(sc.N_TP_ALERTS,0) N_TP_ALERTS,\n        COALESCE(sc.N_EVALUATED_EPISODES,0) N_EVALUATED_EPISODES,\n        COALESCE(ev.N_EVENTS_DETECTABLE,0) N_EVENTS_DETECTABLE,\n        COALESCE(q.N_RAW_EPISODES,0) N_RAW_EPISODES,\n        COALESCE(q.N_RAW_ENTITIES,0) N_RAW_ENTITIES,\n        COALESCE(d.N_EVALUATION_DAYS,0) N_EVALUATION_DAYS,\n        COALESCE(d.N_SOURCE_EVALUATIONS,0) N_SOURCE_EVALUATIONS,COALESCE(d.N_ELIGIBLE_EVALUATIONS,0) N_ELIGIBLE_EVALUATIONS,\n        COALESCE(am.MAX_DAILY_ALERTS,0) MAX_DAILY_ALERTS,\n        et.SUM_EVENT_NOMINAL,tp.SUM_NOMINAL_TP,tp.SUM_TP_COST\n FROM GRID g\n LEFT JOIN EVENT_TOTAL et ON g.PORTFOLIO=et.PORTFOLIO\n LEFT JOIN EVENT_DETECTABLE ev ON g.PORTFOLIO=ev.PORTFOLIO AND g.INDICATOR=ev.INDICATOR AND g.THRESHOLD_A=ev.THRESHOLD_A\n LEFT JOIN TP tp ON g.PORTFOLIO=tp.PORTFOLIO AND g.INDICATOR=tp.INDICATOR\n  AND g.THRESHOLD_A=tp.THRESHOLD_A AND g.THRESHOLD_B=tp.THRESHOLD_B\n LEFT JOIN SIGNAL_CLASS sc ON g.PORTFOLIO=sc.PORTFOLIO AND g.INDICATOR=sc.INDICATOR\n  AND g.THRESHOLD_A=sc.THRESHOLD_A AND g.THRESHOLD_B=sc.THRESHOLD_B\n LEFT JOIN RAW_QA q ON g.PORTFOLIO=q.PORTFOLIO AND g.INDICATOR=q.INDICATOR\n  AND g.THRESHOLD_A=q.THRESHOLD_A AND g.THRESHOLD_B=q.THRESHOLD_B\n LEFT JOIN EVAL_DAYS d ON g.PORTFOLIO=d.PORTFOLIO AND g.INDICATOR=d.INDICATOR AND g.THRESHOLD_A=d.THRESHOLD_A\n LEFT JOIN ALERT_MAX am ON g.PORTFOLIO=am.PORTFOLIO AND g.INDICATOR=am.INDICATOR\n  AND g.THRESHOLD_A=am.THRESHOLD_A AND g.THRESHOLD_B=am.THRESHOLD_B\n)\nSELECT m.PORTFOLIO,m.INDICATOR,'FULL_EWS' TARGET_SCOPE,\n       m.THRESHOLD_A,m.THRESHOLD_B,NULL::DOUBLE THRESHOLD_C,\n       m.N_EVENTS,m.N_TP,m.N_FP,GREATEST(m.N_EVENTS-m.N_TP,0) N_FN,\n       m.N_TP+m.N_FP N_ALERTS,m.N_EVALUATED_EPISODES,m.N_TP_ALERTS,\n       IFF(m.N_TP+m.N_FP>0,ROUND(m.N_TP/(m.N_TP+m.N_FP),4),NULL) ACCURACY,\n       IFF(m.N_EVENTS>0,ROUND(m.N_TP/m.N_EVENTS,4),NULL) COVERAGE,\n       IFF(m.N_EVENTS_DETECTABLE>0,ROUND(m.N_TP/m.N_EVENTS_DETECTABLE,4),NULL) COVERAGE_2,\n       IFF(MAX(m.N_TP) OVER (PARTITION BY m.PORTFOLIO,m.INDICATOR)>0,\n           ROUND(m.N_TP/MAX(m.N_TP) OVER(PARTITION BY m.PORTFOLIO,m.INDICATOR),4),NULL) COVERAGE_3,\n       IFF(m.N_EVALUATED_EPISODES>0,ROUND(m.N_TP_ALERTS/m.N_EVALUATED_EPISODES,4),NULL) ALERT_PRECISION,\n       m.N_EVENTS_DETECTABLE,m.N_RAW_EPISODES,m.N_RAW_ENTITIES,\n       m.N_EVALUATION_DAYS,m.MAX_DAILY_ALERTS,m.N_SOURCE_EVALUATIONS,m.N_ELIGIBLE_EVALUATIONS,\n       IFF(m.N_EVALUATION_DAYS>0,ROUND(m.N_EVALUATED_EPISODES/m.N_EVALUATION_DAYS,4),NULL) AVG_DAILY_ALERTS,\n       IFF(m.N_EVALUATION_DAYS>0,ROUND(m.N_RAW_EPISODES/m.N_EVALUATION_DAYS,4),NULL) AVG_DAILY_RAW_EPISODES,\n       ROUND(1000*m.N_TP+200*m.N_FP+0.5*COALESCE(m.SUM_TP_COST,0)+0.20*GREATEST(COALESCE(m.SUM_EVENT_NOMINAL,0)-COALESCE(m.SUM_NOMINAL_TP,0),0),2) TOTAL_COST_CF1,\n       ROUND(1000*m.N_TP+200*m.N_FP+0.5*COALESCE(m.SUM_TP_COST,0)+0.20*GREATEST(COALESCE(m.SUM_EVENT_NOMINAL,0)-COALESCE(m.SUM_NOMINAL_TP,0),0),2) TOTAL_COST,\n       'ELIGIBLE_KNOWN_EXPOSURE_ONLY' COST_CF1_STATUS,\n       'CANDIDATE_FILTERED_SOURCE' RESULT_STATUS,\n       'MONTHLY' DATA_FREQUENCY\nFROM METRIC_BASE m ORDER BY m.PORTFOLIO,m.INDICATOR,m.THRESHOLD_A,m.THRESHOLD_B"
+sql=SQL_TEMPLATE.format(T=T,B=B,L=L,E=E,H=H,F=F,start=start,end=end,adc=nums(ADC),ip=nums(IP),other=nums(KNOWN-ADC-IP-{555}),values=values)
+status=query('SELECT FEATURE_STATUS,COUNT(*) N_ROWS FROM '+F+' GROUP BY 1')
+print('FEATURE STATUS |',status.to_string(index=False),flush=True)
+query('SELECT * FROM ('+sql+') z WHERE 1=0')
+x=query(sql)
+keys=['PORTFOLIO','INDICATOR','THRESHOLD_A','THRESHOLD_B']
+ports={'GLOBAL','LARGE_CORPORATE','MID_CORPORATE','OTHER_CORPORATE','ADC','IP'}
+assert len(x)==90 and not x.duplicated(keys).any()
+assert set(zip(x.PORTFOLIO,x.INDICATOR,x.THRESHOLD_A,x.THRESHOLD_B))=={(p,i,a,b) for p in ports for i,a,b in items}
+assert (x.N_TP+x.N_FN).eq(x.N_EVENTS).all()
+assert (x.N_TP_ALERTS+x.N_FP).eq(x.N_EVALUATED_EPISODES).all()
+assert x.N_TP.le(x.N_EVENTS_DETECTABLE).all()
+assert x.N_ELIGIBLE_EVALUATIONS.le(x.N_SOURCE_EVALUATIONS).all()
+for c in ['ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION']:
+    assert x[c].dropna().between(0,1).all(),c
+blocked=x.N_ELIGIBLE_EVALUATIONS.eq(0)
+reason='; '.join(status.loc[status.FEATURE_STATUS.ne('CANDIDATE_FILTERED_SOURCE'),'FEATURE_STATUS'].astype(str))
+x['RESULT_STATUS']=np.where(blocked,'NOT_EVALUABLE','CANDIDATE_FILTERED_SOURCE')
+x['STATUS_DETAILS']='Filtered excess source; no extra amount threshold; first observed account-level qualification, summed at entity level; stable monthly customer mapping; source completeness and episode reset convention pending validation.'
+if reason: x.loc[blocked,'STATUS_DETAILS']=reason
+for c in ['N_TP','N_FP','N_FN','N_ALERTS','N_EVALUATED_EPISODES','N_TP_ALERTS','ACCURACY','COVERAGE','COVERAGE_2','COVERAGE_3','ALERT_PRECISION','AVG_DAILY_ALERTS','AVG_DAILY_RAW_EPISODES','MAX_DAILY_ALERTS','TOTAL_COST_CF1','TOTAL_COST']:
+    x.loc[blocked,c]=np.nan
+# Preserve known raw counts and actual availability, even in blocked configurations.
+print(x.groupby('PORTFOLIO').agg(N_CONFIGS=('INDICATOR','size'),MAX_SOURCE=('N_SOURCE_EVALUATIONS','max'),MAX_ELIGIBLE=('N_ELIGIBLE_EVALUATIONS','max'),MAX_RAW=('N_RAW_EPISODES','max'),MAX_TP=('N_TP','max')).to_string(),flush=True)
+print(x[keys+['N_EVENTS','N_EVENTS_DETECTABLE','N_SOURCE_EVALUATIONS','N_ELIGIBLE_EVALUATIONS','N_RAW_EPISODES','N_TP','N_FP','ACCURACY','COVERAGE','RESULT_STATUS']].to_string(index=False),flush=True)
+dataiku.Dataset(OUTPUT,project_key=PROJECT).write_with_schema(x)
+print('FINISHED |',OUTPUT,'|',len(x),'configurations',flush=True)
+'''
+
+# Preflight before any Flow object is created.
+import dataiku
+import re
+
+PROJECT='VALIDATIONEWSCORPORATEPORTFOLIODAILY'
+CONNECTION='DEV_AA_TEAMS'
+SOURCE='Overdraft_Excess_s'
+FEATURES='overdraft_features_Corporate'
+RESULTS='results_Corporate_Overdrafts'
+FEATURE_RECIPE='compute_overdraft_features_Corporate'
+RESULT_RECIPE='compute_results_Corporate_Overdrafts'
+BASE=['EWS_training_Corporate','EWS_training_Corporate_GEC_Rating_DPD_Arrears_B02','vars_loan_level','vars_entity_level_merged','vars_entity_level']
+project=dataiku.api_client().get_project(PROJECT)
+known={d['name'] for d in project.list_datasets()}
+assert {SOURCE,*BASE}<=known, 'Missing inputs: '+str({SOURCE,*BASE}-known)
+required={'ACCOUNT_ID','ACCOUNT_SUBTYPE','PAST_DUE_AMOUNT_CTV','DAYS_PAST_DUE','CUSTOMER','MAP_DTE'}
+actual={c['name'].upper() for c in dataiku.Dataset(SOURCE,project_key=PROJECT).read_schema()}
+assert required<=actual,'Missing source columns: '+str(required-actual)
+for name in BASE:
+    assert project.get_dataset(name).get_settings().get_raw()['params']['connection']==CONNECTION,name
+# Validate each new recipe before touching the Flow.
+compile(FEATURE_CODE,FEATURE_RECIPE,'exec')
+compile(RESULT_CODE,RESULT_RECIPE,'exec')
+
+def ensure_recipe(name,output,inputs,code):
+    ds={d['name'] for d in project.list_datasets()}
+    recipes={r['name'] for r in project.list_recipes()}
+    if name in recipes:
+        if output not in ds: raise RuntimeError('Existing recipe has no expected output: '+name)
+        current=project.get_recipe(name).get_settings().get_code()
+        if current.strip()!=code.strip():
+            raise RuntimeError('Existing recipe differs; no overwrite: '+name)
+        # Do not silently take over a different producer or an output with another table.
+        prm=project.get_dataset(output).get_settings().get_raw()['params']
+        if prm.get('connection')!=CONNECTION or prm.get('schema','').upper()!='RRG':
+            raise RuntimeError('Existing output has unexpected storage: '+output)
+        if prm.get('table')!=(PROJECT+'_'+output).upper():
+            raise RuntimeError('Existing output has unexpected table: '+output)
+        print('REUSE |',name,flush=True)
+        return
+    if output in ds: raise RuntimeError('Output exists without expected recipe; no overwrite: '+output)
+    builder=project.new_recipe('python',name)
+    for i in inputs: builder.with_input(i)
+    builder.with_new_output_dataset(output,CONNECTION,overwrite=False)
+    builder.with_script(code)
+    builder.create()
+    # Match the uppercase physical table naming convention used in Snowflake.
+    settings=project.get_dataset(output).get_settings()
+    prm=settings.get_raw()['params']
+    assert prm['connection']==CONNECTION and prm['schema'].upper()=='RRG', 'Unexpected new storage; inspect before running'
+    expected=(PROJECT+'_'+output).upper()
+    for d in project.list_datasets():
+        if d['name']==output: continue
+        p=project.get_dataset(d['name']).get_settings().get_raw().get('params',{})
+        table=str(p.get('table','')).replace('${projectKey}',PROJECT).upper()
+        if p.get('connection')==CONNECTION and str(p.get('schema','')).upper()=='RRG' and table==expected:
+            raise RuntimeError('Physical table already assigned to '+d['name'])
+    prm['table']=expected
+    settings.save()
+    print('CREATED |',name,'->',output,flush=True)
+
+ensure_recipe(FEATURE_RECIPE,FEATURES,[SOURCE,BASE[0]],FEATURE_CODE)
+ensure_recipe(RESULT_RECIPE,RESULTS,BASE+[FEATURES],RESULT_CODE)
+for name in (FEATURE_RECIPE,RESULT_RECIPE):
+    print('RUN |',name,flush=True)
+    job=project.get_recipe(name).run(job_type='NON_RECURSIVE_FORCED_BUILD',wait=True)
+    # run(wait=True) blocks until completion; verify explicit state when available.
+    if hasattr(job,'get_status'):
+        state=job.get_status().get('baseStatus',{}).get('state')
+        if state and state not in ('DONE','SUCCESS','SUCCEEDED'):
+            raise RuntimeError('Job did not complete successfully: '+name+' '+str(state))
+    print('COMPLETED |',name,flush=True)
+
+import pandas as pd
+r=dataiku.Dataset(RESULTS,project_key=PROJECT).get_dataframe()
+r.columns=r.columns.str.upper()
+assert len(r)==90 and not r.duplicated(['PORTFOLIO','INDICATOR','THRESHOLD_A','THRESHOLD_B']).any()
+print('\n=== CORPORATE OVERDRAFTS | RESULT SUMMARY ===')
+print(r.groupby(['PORTFOLIO','RESULT_STATUS']).agg(N_CONFIGS=('INDICATOR','size'),MAX_RAW=('N_RAW_EPISODES','max'),MAX_ELIGIBLE=('N_ELIGIBLE_EVALUATIONS','max'),MAX_TP=('N_TP','max')).to_string())
+print('\n=== GLOBAL CONFIGURATIONS ===')
+print(r.loc[r.PORTFOLIO.eq('GLOBAL'),['INDICATOR','THRESHOLD_A','THRESHOLD_B','N_EVENTS','N_EVENTS_DETECTABLE','N_SOURCE_EVALUATIONS','N_ELIGIBLE_EVALUATIONS','N_RAW_EPISODES','N_TP','N_FP','ACCURACY','COVERAGE','RESULT_STATUS','STATUS_DETAILS']].to_string(index=False))
+print('\nFINISHED | 90 reporting configurations | existing branches untouched',flush=True)
